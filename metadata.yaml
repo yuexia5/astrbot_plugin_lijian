@@ -3,6 +3,6 @@ display_name: 璃笺
 desc: 无头环境下运行璃笺日记库：AI 写入、指令管理、书架页面。
 short_desc: 日记与便签的本地书库，支持 AI 写入与书架页面。
 version: v1.0.0
-author: Lijian
-repo: https://github.com/local/lijian
+author:: baiwei
+repo: https://github.com/yuexia5/astrbot_plugin_lijian
 astrbot_version: ">=4.16.0"
