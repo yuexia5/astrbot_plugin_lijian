@@ -2,7 +2,7 @@ name: astrbot_plugin_lijian
 display_name: 璃笺
 desc: 运行在 AstrBot 内的本地日记与便签书库：AI 可以自动写日记、读日记、整理归档， 你也可以在 AstrBot WebUI 的书架页里像翻书一样阅读和编辑每一篇。
 short_desc: 日记与便签的本地书库，支持 AI 写入与书架页面。
-version: v1.0.0
+version: v1.0
 author: baiwei
 repo: https://github.com/yuexia5/astrbot_plugin_lijian
 astrbot_version: ">=4.16.0"
