@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>璃笺书架</title>
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+<div class="wall">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">笺</span>
+      <span class="brand-name">璃笺</span>
+      <span class="brand-sub">Bookshelf</span>
+    </div>
+    <label class="search">
+      <svg viewBox="0 0 24 24" class="search-icon" aria-hidden="true">
+        <circle cx="11" cy="11" r="7"></circle>
+        <line x1="16.5" y1="16.5" x2="21" y2="21"></line>
+      </svg>
+      <input id="searchInput" type="search" placeholder="搜索书名、内容、标签…" autocomplete="off" />
+    </label>
+    <nav class="tabs" id="tabs">
+      <button data-tab="all" class="is-active">全部</button>
+      <button data-tab="diary">日记</button>
+      <button data-tab="note">便签</button>
+      <button data-tab="archived">归档</button>
+    </nav>
+    <div class="topbar-actions">
+      <span class="stats" id="statsText"></span>
+      <button class="btn ghost" id="exportBtn" title="导出全部为 Markdown">导出</button>
+      <button class="btn primary" id="newBtn">＋ 新日记</button>
+      <button class="btn ghost icon" id="settingsBtn" title="状态与写入令牌">⚙</button>
+    </div>
+  </header>
+
+  <main class="shelves" id="shelves"></main>
+
+  <div class="empty" id="empty" hidden>
+    <div class="empty-shelf">
+      <span class="empty-book"></span>
+      <span class="empty-book"></span>
+      <span class="empty-book"></span>
+    </div>
+    <p id="emptyText">书架上空空如也</p>
+    <button class="btn primary" id="emptyNew">写下第一篇日记</button>
+  </div>
+</div>
+
+<div class="dim" id="dim"></div>
+
+<section class="reader" id="reader" hidden>
+  <div class="book3d" id="book3d" aria-hidden="true">
+    <div class="page page-left">
+      <div class="face cover cover-left"></div>
+      <div class="face content" id="coverLeft"></div>
+    </div>
+    <div class="spine"></div>
+    <div class="page page-right">
+      <div class="face cover cover-right"></div>
+      <div class="face content" id="coverRight"></div>
+    </div>
+  </div>
+
+  <article class="reader-card" id="readerCard">
+    <header class="reader-toolbar">
+      <button class="btn ghost back" id="backBtn">‹ 放回书架</button>
+      <input class="reader-title" id="readerTitle" placeholder="未命名" readonly />
+      <div class="reader-actions">
+        <button class="btn ghost" id="editBtn">编辑</button>
+        <button class="btn ghost" id="exportOneBtn">导出</button>
+        <button class="btn danger" id="archiveBtn">归档</button>
+      </div>
+    </header>
+    <div class="reader-meta" id="readerMeta"></div>
+    <div class="reader-scroll markdown-body" id="readerBody"></div>
+    <div class="reader-footer" id="readerFooter"></div>
+    <div class="editor-panel" id="editorPanel" hidden>
+      <div class="editor-fields">
+        <input id="editorTags" placeholder="标签，用逗号分隔" autocomplete="off" />
+        <input id="editorDate" type="date" />
+      </div>
+      <textarea id="editorBody" spellcheck="false"></textarea>
+      <div class="editor-actions">
+        <span class="editor-hint">Ctrl / ⌘ + Enter 保存</span>
+        <button class="btn ghost" id="cancelBtn">取消</button>
+        <button class="btn primary" id="saveBtn">保存</button>
+      </div>
+    </div>
+  </article>
+</section>
+
+<div class="toast" id="toast" hidden></div>
+
+<div class="modal" id="settingsModal" hidden>
+  <div class="modal-card">
+    <h3>璃笺状态</h3>
+    <dl id="statusList"></dl>
+    <div class="token-row">
+      <input id="tokenField" readonly onclick="this.select()" />
+      <button class="btn" id="copyTokenBtn">复制</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="closeModal">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "bridge_enabled": {
+    "description": "启用本地写入接口",
+    "type": "bool",
+    "default": true,
+    "hint": "监听本机端口，兼容桌面版璃笺的 HTTP 写入接口。"
+  },
+  "bridge_host": {
+    "description": "接口监听地址",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "只在本机使用请保持 127.0.0.1。"
+  },
+  "bridge_port": {
+    "description": "接口监听端口",
+    "type": "int",
+    "default": 27176,
+    "hint": "与桌面版璃笺默认端口一致。修改后需重载插件。"
+  },
+  "db_path": {
+    "description": "数据库文件路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用插件数据目录；填写已有 lijian.sqlite3 的完整路径可直接迁移旧数据。"
+  },
+  "token": {
+    "description": "写入令牌",
+    "type": "string",
+    "default": "",
+    "hint": "留空自动生成（首次写入数据库）。填写桌面版璃笺的 AI 写入令牌可保持兼容。"
+  },
+  "default_mode": {
+    "description": "默认写入模式",
+    "type": "string",
+    "default": "append_today",
+    "options": ["append_today", "create"],
+    "labels": ["追加到今日日记", "创建新日记"],
+    "hint": "工具调用未指定 mode 时使用。"
+  }
+}
