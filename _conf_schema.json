@@ -36,5 +36,11 @@
     "options": ["append_today", "create"],
     "labels": ["追加到今日日记", "创建新日记"],
     "hint": "工具调用未指定 mode 时使用。"
+  },
+  "diary_template": {
+    "description": "新日记模板",
+    "type": "text",
+    "default": "**天气**：\n**心情**：\n\n## 今天做了什么\n\n- \n\n## 三件小事\n\n1. \n2. \n3. \n",
+    "hint": "书架页点「新日记」时自动填入。{date} 会替换成当天日期；清空则新建空白日记。"
   }
 }

@@ -11,6 +11,11 @@ const state = {
   current: null,
   editing: false,
   timers: [],
+  template: "",
+  apiBase: "",
+  signature: "",
+  pollTimer: null,
+  pendingRefresh: false,
 };
 
 const PALETTES = [
@@ -210,8 +215,8 @@ function renderShelf() {
   const shelves = $("shelves");
   shelves.innerHTML = "";
   const empty = $("empty");
-  const q = state.q.trim().toLowerCase();
 
+  // 搜索已经下沉到后端，这里只按标签页筛一遍，保证切换 tab 不用重新请求。
   const visible = state.notes.filter((note) => {
     if (state.tab === "archived") return note.archived;
     if (note.archived) return false;
@@ -220,13 +225,7 @@ function renderShelf() {
     return true;
   });
 
-  const searched = visible.filter((note) => {
-    if (!q) return true;
-    const haystack = [note.title, note.body_md, (note.tags || []).join(" "), noteDate(note)]
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(q);
-  });
+  const searched = visible;
 
   const byDate = (a, b) => {
     if (Boolean(b.pinned) !== Boolean(a.pinned)) return Number(b.pinned) - Number(a.pinned);
@@ -284,13 +283,17 @@ function renderShelf() {
   }
 }
 
+async function fetchNotes(q) {
+  // light=1：只要摘要。正文在打开书的时候单独拉，列表页不必背着整库正文。
+  const params = { include_archived: "1", light: "1" };
+  const keyword = (q || "").trim();
+  if (keyword) params.q = keyword;
+  return await bridge.apiGet("notes", params);
+}
+
 async function reload() {
   try {
-    // 带上正文，搜索才能真正命中内容（列表默认只回摘要）。
-    const result = await bridge.apiGet("notes", {
-      include_archived: true,
-      include_body: "1",
-    });
+    const result = await fetchNotes(state.q);
     state.notes = Array.isArray(result.notes) ? result.notes : [];
   } catch (error) {
     toast("读取书架失败：" + error.message);
@@ -325,7 +328,7 @@ function prepareBook3d(note) {
     cover.appendChild(span);
   });
 
-  const clean = note.body_md.replace(/^---[\s\S]*?---/, "").trim();
+  const clean = String(note.body_md || "").replace(/^---[\s\S]*?---/, "").trim();
   const text = clean.replace(/[#>*_`~\-[\]()|]/g, "").replace(/\s+/g, " ").trim();
   const first = text.slice(0, 120);
   const rest = text.slice(120, 320);
@@ -411,6 +414,11 @@ async function closeBook() {
   }
   await wait(560);
   state.opening = false;
+  // 看书期间 AI 写过东西的话，合上书再刷新一次
+  if (state.pendingRefresh) {
+    state.pendingRefresh = false;
+    await reload();
+  }
 }
 
 /* ---------------- 阅读 / 编辑 ---------------- */
@@ -450,6 +458,8 @@ function renderRead() {
   const isArchived = Boolean(note.archived);
   $("archiveBtn").textContent = isArchived ? "恢复" : "归档";
   $("archiveBtn").classList.toggle("danger", !isArchived);
+  $("pinBtn").textContent = note.pinned ? "取消置顶" : "置顶";
+  $("pinBtn").classList.toggle("is-active", Boolean(note.pinned));
 }
 
 function enterEdit() {
@@ -520,15 +530,199 @@ async function exportCurrent() {
   }
 }
 
+async function togglePin() {
+  const note = state.current;
+  if (!note) return;
+  const action = note.pinned ? "unpin" : "pin";
+  try {
+    const result = await bridge.apiPost("notes/" + note.id + "/" + action, {});
+    state.current = result.note || { ...note, pinned: !note.pinned };
+    renderRead();
+    toast(result.message || "已更新");
+    await reload();
+  } catch (error) {
+    toast("操作失败：" + error.message);
+  }
+}
+
+function applyTab() {
+  document.querySelectorAll("#tabs button").forEach((el) => {
+    el.classList.toggle("is-active", el.dataset.tab === state.tab);
+  });
+}
+
+async function randomBook() {
+  if (state.opening) return;
+  const params = {};
+  if (state.current) params.exclude = state.current.id;
+  try {
+    const result = await bridge.apiGet("random", params);
+    const note = result.note;
+    if (!note) {
+      toast("书架上还没有可翻的书");
+      return;
+    }
+    // 翻到的这本可能不在当前标签页里，先切到能看见它的地方
+    if (state.tab === "archived" && !note.archived) state.tab = "all";
+    else if (state.tab === "diary" && note.kind !== "diary") state.tab = "all";
+    else if (state.tab === "note" && note.kind !== "note") state.tab = "all";
+    applyTab();
+    if (!state.notes.some((item) => item.id === note.id)) await reload();
+    const el = findBookEl(note.id);
+    await openBook(el, note);
+  } catch (error) {
+    toast("没翻到：" + error.message);
+  }
+}
+
+/* ---------------- 图片 ---------------- */
+
+function insertAtCursor(textarea, text) {
+  const start = textarea.selectionStart ?? textarea.value.length;
+  const end = textarea.selectionEnd ?? textarea.value.length;
+  const before = textarea.value.slice(0, start);
+  const after = textarea.value.slice(end);
+  const prefix = before && !before.endsWith("\n") ? "\n" : "";
+  textarea.value = before + prefix + text + after;
+  const caret = (before + prefix + text).length;
+  textarea.selectionStart = caret;
+  textarea.selectionEnd = caret;
+  textarea.focus();
+}
+
+async function insertImage(file) {
+  if (!file) return;
+  if (!/^image\/(png|jpeg|gif|webp)$/i.test(file.type)) {
+    toast("只支持 png、jpg、gif、webp");
+    return;
+  }
+  toast("正在上传…");
+  try {
+    const result = await bridge.upload("media", file);
+    if (!result || !result.url) throw new Error("服务端没有返回图片地址");
+    const alt = (file.name || "图片").replace(/\.[^.]+$/, "");
+    insertAtCursor($("editorBody"), `![${alt}](${result.url})\n`);
+    toast("图片已插入");
+  } catch (error) {
+    toast("上传失败：" + error.message);
+  }
+}
+
+/* ---------------- 导出与备份 ---------------- */
+
+async function exportZip() {
+  try {
+    await bridge.download("export/all", {}, "lijian-export.zip");
+    toast("已导出全部日记");
+  } catch (error) {
+    toast("导出失败：" + error.message);
+  }
+}
+
+async function exportJson() {
+  try {
+    const result = await bridge.apiGet("export/json");
+    await downloadBlob(
+      result.filename || "lijian-backup.json",
+      result.content || "{}",
+      "application/json"
+    );
+    toast(`已备份 ${result.count || 0} 册`);
+  } catch (error) {
+    toast("备份失败：" + error.message);
+  }
+}
+
+async function restoreJson(file) {
+  if (!file) return;
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    toast("这个文件不是合法 JSON");
+    return;
+  }
+  const count = Array.isArray(data && data.notes) ? data.notes.length : 0;
+  if (!count) {
+    toast("备份里没有条目");
+    return;
+  }
+  if (!window.confirm(`将导入 ${count} 条，同 id 的会被覆盖。继续？`)) return;
+  try {
+    const result = await bridge.apiPost("import/json", data);
+    toast(result.message || "导入完成");
+    await reload();
+  } catch (error) {
+    toast("恢复失败：" + error.message);
+  }
+}
+
+async function copyWeekly() {
+  try {
+    const result = await bridge.apiGet("weekly");
+    const text = result.digest_md || "";
+    if (!text.trim()) {
+      toast("本周还没有日记");
+      return;
+    }
+    await navigator.clipboard.writeText(text);
+    toast(`已复制本周素材（${result.count || 0} 篇）`);
+  } catch (error) {
+    toast("复制失败：" + error.message);
+  }
+}
+
+/* ---------------- 自动刷新 ---------------- */
+
+async function checkSignature() {
+  // 页面在后台、正在新建/编辑、或者正开着书的时候都不打扰，
+  // 等回到书架再一次性刷新。
+  if (document.hidden) return;
+  if (state.opening || state.editing) return;
+  if (!$("reader").hidden) {
+    state.pendingRefresh = true;
+    return;
+  }
+  try {
+    const result = await bridge.apiGet("signature");
+    const next = result.signature || "";
+    if (!state.signature) {
+      state.signature = next;
+      return;
+    }
+    if (next !== state.signature) {
+      state.signature = next;
+      await reload();
+    }
+  } catch {
+    // 网络抖一下就跳过，下一轮再试
+  }
+}
+
+function startWatcher() {
+  stopWatcher();
+  state.pollTimer = setInterval(checkSignature, 6000);
+}
+
+function stopWatcher() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
 /* ---------------- 新建 ---------------- */
 
 async function newDiary() {
   if (state.opening) return;
   const today = isoToday();
+  // 模板里可以写 {date}，换成当天日期；模板为空就还是空白日记。
+  const template = String(state.template || "").replace(/\{date\}/g, today);
+  const bodyMd = "# 日记 " + today + "\n\n" + template;
   try {
     const result = await bridge.apiPost("notes", {
       title: "日记 " + today,
-      body_md: "# 日记 " + today + "\n\n",
+      body_md: bodyMd,
       kind: "diary",
       diary_date: today,
       tags: ["日记"],
@@ -561,10 +755,31 @@ function safeLink(text, href) {
   return text;
 }
 
+// 本地图片在正文里写成 media/<32位hex>.<ext>，只认这个形状，别的原样显示文字。
+const MEDIA_REF = /^(?:\.\/)?media\/([0-9a-f]{32}\.(?:png|jpg|jpeg|gif|webp))$/i;
+
+function guessApiBase() {
+  const matched = location.pathname.match(/^(.*\/plugins\/extensions\/[^/]+)/);
+  return matched ? matched[1] : "";
+}
+
+function mediaUrl(name) {
+  // 优先用后端告诉我们的前缀；拿不到就从当前地址推；再不行退回固定路径。
+  const base =
+    state.apiBase ||
+    guessApiBase() ||
+    "/api/v1/plugins/extensions/astrbot_plugin_lijian";
+  return base + "/media/" + name;
+}
+
 function safeImg(alt, src) {
   const url = String(src || "").trim();
   if (/^(https?:|data:image\/)/i.test(url)) {
     return `<img src="${escapeHtml(url)}" alt="${escapeHtml(alt || "")}" loading="lazy" />`;
+  }
+  const local = url.match(MEDIA_REF);
+  if (local) {
+    return `<img src="${escapeHtml(mediaUrl(local[1]))}" alt="${escapeHtml(alt || "")}" loading="lazy" />`;
   }
   return escapeHtml(alt || "图片");
 }
@@ -769,21 +984,24 @@ function bindEvents() {
     const button = event.target.closest("button[data-tab]");
     if (!button) return;
     state.tab = button.dataset.tab;
-    document.querySelectorAll("#tabs button").forEach((el) => el.classList.toggle("is-active", el === button));
+    applyTab();
     renderShelf();
   });
 
   let searchTimer = null;
   $("searchInput").addEventListener("input", (event) => {
+    const value = event.target.value;
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      state.q = event.target.value;
-      renderShelf();
-    }, 160);
+    // 搜索交给后端做，中文两个字也能命中，不用把整库正文拉到页面里。
+    searchTimer = setTimeout(async () => {
+      state.q = value;
+      await reload();
+    }, 260);
   });
 
   $("newBtn").addEventListener("click", () => newDiary());
   $("emptyNew").addEventListener("click", () => newDiary());
+  $("randomBtn").addEventListener("click", () => randomBook());
 
   $("backBtn").addEventListener("click", () => closeBook());
   $("editBtn").addEventListener("click", () => (state.editing ? renderRead() : enterEdit()));
@@ -791,13 +1009,41 @@ function bindEvents() {
   $("saveBtn").addEventListener("click", () => saveEdit());
   $("archiveBtn").addEventListener("click", () => archiveCurrent());
   $("exportOneBtn").addEventListener("click", () => exportCurrent());
+  $("pinBtn").addEventListener("click", () => togglePin());
 
-  $("exportBtn").addEventListener("click", async () => {
-    try {
-      await bridge.download("export/all", {}, "lijian-export.zip");
-      toast("已导出全部日记");
-    } catch (error) {
-      toast("导出失败：" + error.message);
+  $("insertImageBtn").addEventListener("click", () => $("imageInput").click());
+  $("imageInput").addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    await insertImage(file);
+  });
+  $("jsonInput").addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    await restoreJson(file);
+  });
+
+  $("exportBtn").addEventListener("click", (event) => {
+    event.stopPropagation();
+    const menu = $("exportMenu");
+    menu.hidden = !menu.hidden;
+    $("exportBtn").setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  $("exportMenu").addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-export]");
+    if (!button) return;
+    $("exportMenu").hidden = true;
+    $("exportBtn").setAttribute("aria-expanded", "false");
+    const action = button.dataset.export;
+    if (action === "zip") await exportZip();
+    else if (action === "json") await exportJson();
+    else if (action === "restore") $("jsonInput").click();
+    else if (action === "weekly") await copyWeekly();
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".menu-wrap")) {
+      $("exportMenu").hidden = true;
+      $("exportBtn").setAttribute("aria-expanded", "false");
     }
   });
 
@@ -834,6 +1080,16 @@ function bindEvents() {
   bridge.onContext(() => {});
 }
 
+async function loadStatus() {
+  try {
+    const status = await bridge.apiGet("status");
+    state.template = status.diary_template || "";
+    state.apiBase = status.api_base || guessApiBase();
+  } catch {
+    state.apiBase = guessApiBase();
+  }
+}
+
 async function init() {
   try {
     await bridge.ready();
@@ -841,7 +1097,12 @@ async function init() {
     // 即使 bridge 未就绪也尽量加载页面
   }
   bindEvents();
+  await loadStatus();
   await reload();
+  // 先记下当前签名，之后每次轮询拿它比对，AI 写进来的东西才能自己冒出来
+  await checkSignature();
+  startWatcher();
+  window.addEventListener("beforeunload", stopWatcher);
 }
 
 init();

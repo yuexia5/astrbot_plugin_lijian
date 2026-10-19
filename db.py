@@ -214,7 +214,8 @@ class Database:
 
     # ---------- 便签 / 日记 ----------
 
-    def list_notes(self, include_archived: bool = False) -> list[dict[str, Any]]:
+    def list_notes(self, include_archived: bool = False, light: bool = False) -> list[dict[str, Any]]:
+        """列出条目。light=True 时不带 body_md，书架首屏省带宽。"""
         with self._lock:
             if include_archived:
                 rows = self.conn.execute(
@@ -224,7 +225,183 @@ class Database:
                 rows = self.conn.execute(
                     "SELECT * FROM notes WHERE archived = 0 ORDER BY pinned DESC, updated_at DESC"
                 ).fetchall()
+            return [self._note_from_row(row, light=light) for row in rows]
+
+    def search_notes(
+        self,
+        q: str,
+        include_archived: bool = False,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """在标题、正文、标签、日期里找，大小写不敏感。
+
+        没上 FTS5 是有意的：trigram 分词最小三字符，「牡丹」「曹州」这类两字词
+        直接搜不到；unicode61 又不切中文。日记这个量级 LIKE 全表扫是毫秒级，
+        换成 FTS 反而要额外维护同步表，还换来一个中文查不准的坑。
+        """
+        q = str(q or "").strip()
+        if not q:
+            return self.list_notes(include_archived)
+
+        escaped = q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        pattern = f"%{escaped}%"
+        sql = (
+            "SELECT * FROM notes WHERE ("
+            "title LIKE ?1 ESCAPE '\\' OR body_md LIKE ?1 ESCAPE '\\' "
+            "OR tags_json LIKE ?1 ESCAPE '\\' OR diary_date LIKE ?1 ESCAPE '\\'"
+            ")"
+        )
+        if not include_archived:
+            sql += " AND archived = 0"
+        sql += " ORDER BY pinned DESC, updated_at DESC LIMIT ?2"
+        with self._lock:
+            rows = self.conn.execute(sql, (pattern, max(1, int(limit)))).fetchall()
             return [self._note_from_row(row) for row in rows]
+
+    def random_note(
+        self,
+        kind: Optional[str] = None,
+        exclude_id: Optional[str] = None,
+        include_archived: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """随手翻一篇。exclude_id 用来避免连点两次翻到同一本。"""
+        sql = "SELECT * FROM notes WHERE 1 = 1"
+        params: list[Any] = []
+        if not include_archived:
+            sql += " AND archived = 0"
+        if kind in ("note", "diary"):
+            sql += " AND kind = ?"
+            params.append(kind)
+        if exclude_id:
+            sql += " AND id <> ?"
+            params.append(exclude_id)
+        sql += " ORDER BY RANDOM() LIMIT 1"
+        with self._lock:
+            row = self.conn.execute(sql, tuple(params)).fetchone()
+            return self._note_from_row(row) if row is not None else None
+
+    def notes_in_range(
+        self,
+        start: str,
+        end: str,
+        kind: Optional[str] = "diary",
+    ) -> list[dict[str, Any]]:
+        """按日期区间取条目（闭区间），供周报聚合用。
+
+        日期优先用 diary_date；没有的退回 created_at 的本地日期，
+        这样导入进来的旧日记也不会漏。
+        """
+        sql = (
+            "SELECT * FROM notes WHERE archived = 0 AND "
+            "COALESCE(diary_date, date(created_at, 'localtime')) BETWEEN ?1 AND ?2"
+        )
+        params: list[Any] = [start, end]
+        if kind in ("note", "diary"):
+            sql += " AND kind = ?3"
+            params.append(kind)
+        sql += " ORDER BY COALESCE(diary_date, date(created_at, 'localtime')) ASC"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+            return [self._note_from_row(row) for row in rows]
+
+    # ---------- 全量备份 ----------
+
+    # 只导出这些设置项；令牌之类绝不进备份包。
+    BACKUP_SETTINGS_KEYS = ("theme", "editor_font_size", "quick_font_size", "tile_font_size")
+
+    def export_json(self) -> dict[str, Any]:
+        """完整备份：保留 id、创建时间、来源、置顶状态，换机器也搬得回去。"""
+        with self._lock:
+            notes = self.list_notes(include_archived=True)
+            settings = {
+                key: self._get_setting(key)
+                for key in self.BACKUP_SETTINGS_KEYS
+                if self._get_setting(key) is not None
+            }
+            return {
+                "format": "lijian-backup",
+                "version": 1,
+                "exported_at": now(),
+                "count": len(notes),
+                "settings": settings,
+                "notes": notes,
+            }
+
+    def import_json(self, payload: Any) -> dict[str, int]:
+        """从备份恢复。同 id 的就地覆盖，没有的新建，坏条目跳过并计数。"""
+        if not isinstance(payload, dict):
+            raise DatabaseError("备份文件不是 JSON 对象")
+        fmt = payload.get("format")
+        if fmt is not None and fmt != "lijian-backup":
+            raise DatabaseError("不是璃笺的备份文件")
+        notes = payload.get("notes")
+        if not isinstance(notes, list):
+            raise DatabaseError("备份里没有 notes 列表")
+
+        created = updated = skipped = 0
+        with self._lock:
+            for item in notes:
+                if not isinstance(item, dict):
+                    skipped += 1
+                    continue
+                note_id = str(item.get("id") or "").strip()
+                body = item.get("body_md")
+                if not note_id or not isinstance(body, str):
+                    skipped += 1
+                    continue
+                title = normalize_title(item.get("title"), body)
+                kind = normalize_kind(item.get("kind"))
+                tags = clean_tags(item.get("tags") or [])
+                diary_date = item.get("diary_date") or None
+                source = str(item.get("source") or "import")
+                pinned = 1 if item.get("pinned") else 0
+                archived = 1 if item.get("archived") else 0
+                created_at = str(item.get("created_at") or now())
+                updated_at = str(item.get("updated_at") or created_at)
+                exists = self.conn.execute(
+                    "SELECT 1 FROM notes WHERE id = ?1", (note_id,)
+                ).fetchone()
+                if exists:
+                    self.conn.execute(
+                        "UPDATE notes SET title=?1, body_md=?2, kind=?3, diary_date=?4, "
+                        "tags_json=?5, source=?6, pinned=?7, archived=?8, updated_at=?9 "
+                        "WHERE id=?10",
+                        (
+                            title,
+                            body,
+                            kind,
+                            diary_date,
+                            json.dumps(tags, ensure_ascii=False),
+                            source,
+                            pinned,
+                            archived,
+                            updated_at,
+                            note_id,
+                        ),
+                    )
+                    updated += 1
+                else:
+                    self.conn.execute(
+                        "INSERT INTO notes (id, title, body_md, kind, diary_date, tags_json, "
+                        "source, pinned, archived, created_at, updated_at) "
+                        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        (
+                            note_id,
+                            title,
+                            body,
+                            kind,
+                            diary_date,
+                            json.dumps(tags, ensure_ascii=False),
+                            source,
+                            pinned,
+                            archived,
+                            created_at,
+                            updated_at,
+                        ),
+                    )
+                    created += 1
+            self._persist()
+        return {"created": created, "updated": updated, "skipped": skipped}
 
     def get_note(self, note_id: str) -> dict[str, Any]:
         """按 id 读取；也接受唯一的 id 前缀（指令里只显示 8 位）。"""
@@ -467,7 +644,7 @@ class Database:
         )
         self._persist()
 
-    def _note_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _note_from_row(self, row: sqlite3.Row, light: bool = False) -> dict[str, Any]:
         tags = json.loads(row["tags_json"] or "[]")
         tile_rect = None
         if row["tile_rect_json"]:
@@ -475,10 +652,9 @@ class Database:
                 tile_rect = json.loads(row["tile_rect_json"])
             except json.JSONDecodeError:
                 tile_rect = None
-        return {
+        data = {
             "id": row["id"],
             "title": row["title"],
-            "body_md": row["body_md"],
             "kind": row["kind"],
             "diary_date": row["diary_date"],
             "tags": tags,
@@ -489,6 +665,10 @@ class Database:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        # 轻量列表不带正文；需要正文的地方不传 light，行为和以前一致。
+        if not light:
+            data["body_md"] = row["body_md"]
+        return data
 
     def _get_setting(self, key: str) -> Optional[str]:
         row = self.conn.execute(

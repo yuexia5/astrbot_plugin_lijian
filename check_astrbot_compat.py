@@ -74,10 +74,19 @@ KNOWN_ROUTES = [
     ("DELETE", f"/{PLUGIN_NAME}/notes/<note_id>"),
     ("POST", f"/{PLUGIN_NAME}/notes/<note_id>/archive"),
     ("POST", f"/{PLUGIN_NAME}/notes/<note_id>/restore"),
+    ("POST", f"/{PLUGIN_NAME}/notes/<note_id>/pin"),
+    ("POST", f"/{PLUGIN_NAME}/notes/<note_id>/unpin"),
     ("GET", f"/{PLUGIN_NAME}/notes/<note_id>/markdown"),
     ("POST", f"/{PLUGIN_NAME}/diary"),
     ("GET", f"/{PLUGIN_NAME}/export/all"),
+    ("GET", f"/{PLUGIN_NAME}/export/json"),
+    ("POST", f"/{PLUGIN_NAME}/import/json"),
     ("POST", f"/{PLUGIN_NAME}/import"),
+    ("GET", f"/{PLUGIN_NAME}/random"),
+    ("GET", f"/{PLUGIN_NAME}/weekly"),
+    ("GET", f"/{PLUGIN_NAME}/signature"),
+    ("POST", f"/{PLUGIN_NAME}/media"),
+    ("GET", f"/{PLUGIN_NAME}/media/<name>"),
     ("GET", f"/{PLUGIN_NAME}/stats"),
     ("GET", f"/{PLUGIN_NAME}/status"),
 ]
@@ -217,7 +226,7 @@ def main() -> int:
         check(False, "框架路由匹配函数", "私有实现已变动，已改用兜底匹配，请人工核对")
 
     for method, route in KNOWN_ROUTES:
-        probe = route.replace("<note_id>", "abc12345").lstrip("/")
+        probe = re.sub(r"<[^>]+>", "abc12345", route).lstrip("/")
         try:
             found = matcher(sink.calls, probe, method)
         except Exception as exc:  # noqa: BLE001

@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -61,7 +63,31 @@ except Exception:  # noqa: BLE001
 PLUGIN_NAME = "astrbot_plugin_lijian"
 # 单篇 Markdown 导入上限。日记再长也到不了这个量级，超过基本是误传大文件。
 MAX_IMPORT_BYTES = 8 * 1024 * 1024
-PLUGIN_VERSION = "1.0.3"
+
+# 本地图片：存在插件数据目录的 media/ 下，正文里写 media/<文件名>。
+MEDIA_DIR_NAME = "media"
+MAX_MEDIA_BYTES = 8 * 1024 * 1024
+MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MEDIA_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+# 上传时文件名是 uuid4 的 32 位十六进制 + 白名单扩展名，读的时候也照这个卡一遍，
+# 挡住 ../ 之类的路径穿越。
+MEDIA_NAME_RE = re.compile(r"^[0-9a-f]{32}\.(?:png|jpg|jpeg|gif|webp)$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# 新建日记时套的模板。{date} 会替换成本地日期。
+DEFAULT_DIARY_TEMPLATE = (
+    "**天气**：\n"
+    "**心情**：\n\n"
+    "## 今天做了什么\n\n- \n\n"
+    "## 三件小事\n\n1. \n2. \n3. \n"
+)
+PLUGIN_VERSION = "1.1.0"
 
 
 @register(
@@ -169,9 +195,18 @@ class LijianPlugin(Star):
         register(f"/{PLUGIN_NAME}/notes/<note_id>", self.api_archive_note, ["DELETE"], "书架：归档条目")
         register(f"/{PLUGIN_NAME}/notes/<note_id>/archive", self.api_archive_note, ["POST"], "书架：归档条目")
         register(f"/{PLUGIN_NAME}/notes/<note_id>/restore", self.api_restore_note, ["POST"], "书架：恢复条目")
+        register(f"/{PLUGIN_NAME}/notes/<note_id>/pin", self.api_pin_note, ["POST"], "书架：置顶条目")
+        register(f"/{PLUGIN_NAME}/notes/<note_id>/unpin", self.api_unpin_note, ["POST"], "书架：取消置顶")
         register(f"/{PLUGIN_NAME}/diary", self.api_write_diary, ["POST"], "书架：写入今日日记")
         register(f"/{PLUGIN_NAME}/notes/<note_id>/markdown", self.api_note_markdown, ["GET"], "书架：导出单篇")
         register(f"/{PLUGIN_NAME}/export/all", self.api_export_all, ["GET"], "书架：导出全部 (zip)")
+        register(f"/{PLUGIN_NAME}/export/json", self.api_export_json, ["GET"], "书架：全量 JSON 备份")
+        register(f"/{PLUGIN_NAME}/import/json", self.api_import_json, ["POST"], "书架：从 JSON 备份恢复")
+        register(f"/{PLUGIN_NAME}/random", self.api_random_note, ["GET"], "书架：随手翻一篇")
+        register(f"/{PLUGIN_NAME}/weekly", self.api_weekly, ["GET"], "书架：周报素材")
+        register(f"/{PLUGIN_NAME}/signature", self.api_signature, ["GET"], "书架：内容签名（轮询用）")
+        register(f"/{PLUGIN_NAME}/media", self.api_upload_media, ["POST"], "书架：上传图片")
+        register(f"/{PLUGIN_NAME}/media/<name>", self.api_get_media, ["GET"], "书架：读取图片")
         register(f"/{PLUGIN_NAME}/import", self.api_import, ["POST"], "书架：导入 Markdown")
         register(f"/{PLUGIN_NAME}/stats", self.api_stats, ["GET"], "书架：统计")
         register(f"/{PLUGIN_NAME}/status", self.api_status, ["GET"], "书架：运行状态")
@@ -398,6 +433,49 @@ class LijianPlugin(Star):
             ensure_ascii=False,
         )
 
+    @filter.llm_tool(name="lijian_weekly")
+    async def lijian_weekly(
+        self,
+        event: AstrMessageEvent,
+        start_date: str = "",
+        end_date: str = "",
+    ):
+        """把一段时间的璃笺日记聚合成周报素材，供你进一步总结成周记。
+
+        只返回原文聚合，不会替你下结论。拿到 digest_md 之后自行归纳即可；
+        如果用户要求存档，可再调用 write_lijian_diary 把总结写回去。
+
+        Args:
+            start_date(string): 起始日期 YYYY-MM-DD，留空表示本周一。
+            end_date(string): 结束日期 YYYY-MM-DD，留空表示今天。
+        """
+        if self._db is None:
+            return self._tool_error("璃笺周报读取失败", RuntimeError("数据库不可用"))
+        default_start, default_end = local_week_range()
+        start = (start_date or default_start).strip()
+        end = (end_date or default_end).strip()
+        if not (DATE_RE.match(start) and DATE_RE.match(end)):
+            return self._tool_error(
+                "璃笺周报读取失败", ValueError("日期格式应为 YYYY-MM-DD")
+            )
+        if start > end:
+            start, end = end, start
+        try:
+            notes = self._db.notes_in_range(start, end)
+        except Exception as exc:
+            logger.warning(f"璃笺周报读取失败: {exc}")
+            return self._tool_error("璃笺周报读取失败", exc)
+        return json.dumps(
+            {
+                "ok": True,
+                "start": start,
+                "end": end,
+                "count": len(notes),
+                "digest_md": build_weekly_digest(notes, start, end),
+            },
+            ensure_ascii=False,
+        )
+
     @filter.llm_tool(name="read_lijian_note")
     async def read_lijian_note(
         self,
@@ -499,25 +577,17 @@ class LijianPlugin(Star):
             "true",
             "yes",
         )
+        # light=1：只回摘要，不带正文。首屏和筛选都不需要正文。
+        light = request.query.get("light", "false").lower() in ("1", "true", "yes")
         kind = request.query.get("kind")
-        q = (request.query.get("q") or "").strip().lower()
-        notes = self._db.list_notes(include_archived)
+        q = (request.query.get("q") or "").strip()
+        # 搜索下沉到 SQL：前端不用把整库正文拉下来再过滤。
+        if q:
+            notes = self._db.search_notes(q, include_archived)
+        else:
+            notes = self._db.list_notes(include_archived, light=light)
         if kind in ("diary", "note"):
             notes = [note for note in notes if note["kind"] == kind]
-        if q:
-            notes = [
-                note
-                for note in notes
-                if q
-                in " ".join(
-                    [
-                        note["title"],
-                        note["body_md"],
-                        " ".join(note["tags"]),
-                        note.get("diary_date") or "",
-                    ]
-                ).lower()
-            ]
         return json_response(
             {"notes": [self._summary(note, include_body) for note in notes]}
         )
@@ -597,6 +667,138 @@ class LijianPlugin(Star):
             return error_response(str(exc), status_code=404 if "not found" in str(exc) else 400)
         return json_response({"note": self._summary(note), "message": "已恢复"})
 
+    async def api_pin_note(self, note_id: str):
+        return self._toggle_pin(note_id, True)
+
+    async def api_unpin_note(self, note_id: str):
+        return self._toggle_pin(note_id, False)
+
+    def _toggle_pin(self, note_id: str, pinned: bool):
+        if self._db is None:
+            return error_response("数据库不可用")
+        try:
+            note = self._db.pin_note(note_id, pinned)
+        except Exception as exc:
+            return error_response(
+                str(exc), status_code=404 if "not found" in str(exc) else 400
+            )
+        return json_response(
+            {"note": self._summary(note), "message": "已置顶" if pinned else "已取消置顶"}
+        )
+
+    async def api_random_note(self):
+        if self._db is None:
+            return error_response("数据库不可用")
+        kind = request.query.get("kind")
+        exclude = request.query.get("exclude") or None
+        try:
+            note = self._db.random_note(
+                kind if kind in ("note", "diary") else None, exclude
+            )
+        except Exception as exc:
+            return error_response(str(exc))
+        if note is None:
+            return error_response("书架上还没有可翻的条目", status_code=404)
+        return json_response({"note": note})
+
+    async def api_signature(self):
+        """给书架页轮询用：只回一行签名，比每次拉全表便宜得多。"""
+        if self._db is None:
+            return error_response("数据库不可用")
+        try:
+            return json_response({"signature": self._db.note_signature()})
+        except Exception as exc:
+            return error_response(str(exc))
+
+    async def api_weekly(self):
+        """把一段时间的日记聚成 Markdown 素材，人工看或交给 AI 总结都行。"""
+        if self._db is None:
+            return error_response("数据库不可用")
+        default_start, default_end = local_week_range()
+        start = (request.query.get("start") or default_start).strip()
+        end = (request.query.get("end") or default_end).strip()
+        if not (DATE_RE.match(start) and DATE_RE.match(end)):
+            return error_response("日期格式应为 YYYY-MM-DD")
+        if start > end:
+            start, end = end, start
+        try:
+            notes = self._db.notes_in_range(start, end)
+        except Exception as exc:
+            return error_response(str(exc))
+        return json_response(
+            {
+                "start": start,
+                "end": end,
+                "count": len(notes),
+                "digest_md": build_weekly_digest(notes, start, end),
+                "notes": [self._summary(note) for note in notes],
+            }
+        )
+
+    async def api_upload_media(self):
+        """图片存到插件数据目录的 media/ 下，正文里引用 media/<文件名>。"""
+        if self._db is None:
+            return error_response("数据库不可用")
+        files = await request.files()
+        upload = files.get("file") if files else None
+        if upload is None:
+            return error_response("缺少图片文件（字段名 file）")
+        original = str(getattr(upload, "filename", "") or "")
+        suffix = Path(original).suffix.lower()
+        if suffix not in MEDIA_SUFFIXES:
+            return error_response("只支持 png、jpg、jpeg、gif、webp")
+
+        media_dir = self._data_dir / MEDIA_DIR_NAME
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return error_response(f"创建图片目录失败：{exc}")
+
+        filename = f"{uuid4().hex}{suffix}"
+        target = media_dir / filename
+        try:
+            target.touch(mode=0o600, exist_ok=True)
+            secure_temp_file(target)
+            from astrbot.api.web import PluginUploadFile
+
+            if isinstance(upload, PluginUploadFile):
+                await upload.save(target)
+            else:
+                target.write_bytes(upload.file.read())
+            secure_temp_file(target)
+            size = target.stat().st_size
+            if size > MAX_MEDIA_BYTES:
+                target.unlink(missing_ok=True)
+                return error_response(
+                    f"图片太大（{size // 1024} KB），上限 {MAX_MEDIA_BYTES // 1024} KB"
+                )
+        except Exception as exc:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return error_response(f"保存图片失败：{exc}")
+
+        return json_response(
+            {
+                "url": f"{MEDIA_DIR_NAME}/{filename}",
+                "name": filename,
+                "size": size,
+            }
+        )
+
+    async def api_get_media(self, name: str):
+        if not MEDIA_NAME_RE.match(str(name or "")):
+            return error_response("非法的文件名", status_code=400)
+        path = self._data_dir / MEDIA_DIR_NAME / name
+        if not path.is_file():
+            return error_response("图片不存在", status_code=404)
+        return file_response(
+            str(path),
+            filename=name,
+            content_type=MEDIA_MIME.get(path.suffix.lower(), "application/octet-stream"),
+        )
+
     async def api_write_diary(self):
         if self._db is None:
             return error_response("数据库不可用")
@@ -647,6 +849,40 @@ class LijianPlugin(Star):
             return error_response(str(exc))
         return file_response(str(tmp), filename="lijian-export.zip", content_type="application/zip")
 
+    async def api_export_json(self):
+        """全量备份：id、时间、标签、置顶全在里面，换机器能原样搬回去。
+
+        直接把 JSON 文本回给前端下载，不落临时文件，也就没有清理问题。
+        """
+        if self._db is None:
+            return error_response("数据库不可用")
+        try:
+            data = self._db.export_json()
+        except Exception as exc:
+            return error_response(str(exc))
+        return json_response(
+            {
+                "filename": f"lijian-backup-{local_today()}.json",
+                "content": json.dumps(data, ensure_ascii=False, indent=2),
+                "count": data.get("count", 0),
+            }
+        )
+
+    async def api_import_json(self):
+        if self._db is None:
+            return error_response("数据库不可用")
+        payload = await request.json(default={})
+        try:
+            result = self._db.import_json(payload)
+        except Exception as exc:
+            return error_response(str(exc))
+        return json_response(
+            {
+                **result,
+                "message": f"新建 {result['created']}，覆盖 {result['updated']}，跳过 {result['skipped']}",
+            }
+        )
+
     async def api_import(self):
         if self._db is None:
             return error_response("数据库不可用")
@@ -693,6 +929,9 @@ class LijianPlugin(Star):
     async def api_status(self):
         if self._db is None:
             return error_response("数据库不可用")
+        template = str(self.config.get("diary_template", "") or "")
+        if not template.strip():
+            template = DEFAULT_DIARY_TEMPLATE
         return json_response(
             {
                 "ok": True,
@@ -707,8 +946,23 @@ class LijianPlugin(Star):
                 },
                 "token": self._db.settings()["ai_token"],
                 "stats": self._db.stats(),
+                "diary_template": template,
+                # 前端拼图片地址时要用；拿不到就让它退回按 location 推。
+                "api_base": self._api_base(),
             }
         )
+
+    def _api_base(self) -> str:
+        """当前插件 API 的前缀，形如 /api/v1/plugins/extensions/<name>。"""
+        try:
+            path = str(request.path or "")
+        except Exception:  # noqa: BLE001
+            return ""
+        marker = f"/{PLUGIN_NAME}"
+        index = path.find(marker)
+        if index <= 0:
+            return ""
+        return path[: index + len(marker)]
 
 
 def cleanup_temp_files(pattern: str, max_age_seconds: int = 3600) -> None:
@@ -741,3 +995,32 @@ def secure_temp_file(path: Path) -> None:
 def split_tags(value: str | list[str] | None) -> list[str]:
     """标签解析交给数据层，统一支持中英文逗号、顿号、分号。"""
     return clean_tags(value)
+
+
+def local_week_range(today: datetime | None = None) -> tuple[str, str]:
+    """本周一到现在（本地时区，闭区间）。"""
+    now_local = today or datetime.now()
+    monday = now_local - timedelta(days=now_local.weekday())
+    return monday.date().isoformat(), now_local.date().isoformat()
+
+
+def build_weekly_digest(notes: list[dict], start: str, end: str) -> str:
+    """把区间内的日记拼成一份 Markdown 素材。
+
+    只做聚合，不做总结——总结该由人或者 AI 来写，
+    插件擅自拟一段反而会盖掉真正想记的东西。
+    """
+    lines = [f"# {start} ~ {end} 的日记", ""]
+    if not notes:
+        lines.append("（这段时间没有日记。）")
+        return "\n".join(lines)
+    for note in notes:
+        date = note.get("diary_date") or (note.get("created_at") or "")[:10]
+        body = str(note.get("body_md") or "").strip()
+        # 正文开头往往自带「# 日记 2026-10-18」，这里去掉，免得标题重复两遍
+        body = re.sub(r"^#\s+[^\n]*\n?", "", body, count=1).strip()
+        lines.append(f"## {date}　{note.get('title') or '未命名'}")
+        lines.append("")
+        lines.append(body or "（空）")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"

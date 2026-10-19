@@ -19,7 +19,7 @@
         <circle cx="11" cy="11" r="7"></circle>
         <line x1="16.5" y1="16.5" x2="21" y2="21"></line>
       </svg>
-      <input id="searchInput" type="search" placeholder="搜索书名、内容、标签…" autocomplete="off" />
+      <input id="searchInput" type="search" placeholder="搜索标题、正文、标签…" autocomplete="off" />
     </label>
     <nav class="tabs" id="tabs">
       <button data-tab="all" class="is-active">全部</button>
@@ -29,7 +29,16 @@
     </nav>
     <div class="topbar-actions">
       <span class="stats" id="statsText"></span>
-      <button class="btn ghost" id="exportBtn" title="导出全部为 Markdown">导出</button>
+      <button class="btn ghost" id="randomBtn" title="随手翻一篇旧日记">随手翻</button>
+      <div class="menu-wrap">
+        <button class="btn ghost" id="exportBtn" aria-haspopup="true" aria-expanded="false">导出 ▾</button>
+        <div class="menu" id="exportMenu" hidden>
+          <button type="button" data-export="zip">全部 Markdown（zip）</button>
+          <button type="button" data-export="json">全量 JSON 备份</button>
+          <button type="button" data-export="restore">从 JSON 恢复…</button>
+          <button type="button" data-export="weekly">复制本周素材</button>
+        </div>
+      </div>
       <button class="btn primary" id="newBtn">＋ 新日记</button>
       <button class="btn ghost icon" id="settingsBtn" title="状态与写入令牌">⚙</button>
     </div>
@@ -68,6 +77,7 @@
       <button class="btn ghost back" id="backBtn">‹ 放回书架</button>
       <input class="reader-title" id="readerTitle" placeholder="未命名" readonly />
       <div class="reader-actions">
+        <button class="btn ghost" id="pinBtn">置顶</button>
         <button class="btn ghost" id="editBtn">编辑</button>
         <button class="btn ghost" id="exportOneBtn">导出</button>
         <button class="btn danger" id="archiveBtn">归档</button>
@@ -84,12 +94,16 @@
       <textarea id="editorBody" spellcheck="false"></textarea>
       <div class="editor-actions">
         <span class="editor-hint">Ctrl / ⌘ + Enter 保存</span>
+        <button class="btn ghost" id="insertImageBtn" title="上传本地图片并插入正文">插入图片</button>
         <button class="btn ghost" id="cancelBtn">取消</button>
         <button class="btn primary" id="saveBtn">保存</button>
       </div>
     </div>
   </article>
 </section>
+
+<input type="file" id="imageInput" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
+<input type="file" id="jsonInput" accept="application/json,.json" hidden />
 
 <div class="toast" id="toast" hidden></div>
 

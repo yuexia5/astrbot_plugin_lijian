@@ -205,7 +205,7 @@ with tempfile.TemporaryDirectory() as tmp:
     token = plugin._db.settings()["ai_token"]
     check("token auto generated", token.startswith("lijian-"))
     check("bridge running", plugin._bridge is not None and plugin._bridge.running)
-    check("web apis registered", len(ctx.registered) == 13)
+    check("web apis registered", len(ctx.registered) == 22)
     routes = {route for route, _, _ in ctx.registered}
     check("route notes list", f"/astrbot_plugin_lijian/notes" in routes)
     check("route archive POST", f"/astrbot_plugin_lijian/notes/<note_id>/archive" in routes)
@@ -254,6 +254,57 @@ with tempfile.TemporaryDirectory() as tmp:
         check("api archive", response["_json"]["message"] == "已归档")
         response = await plugin.api_restore_note(new_id)
         check("api restore", response["_json"]["message"] == "已恢复")
+
+        # Web API: 置顶
+        response = await plugin.api_pin_note(new_id)
+        check("api pin", response["_json"]["note"]["pinned"] is True)
+        response = await plugin.api_unpin_note(new_id)
+        check("api unpin", response["_json"]["note"]["pinned"] is False)
+
+        # Web API: 随手翻
+        request_proxy.query = QueryParams({})
+        response = await plugin.api_random_note()
+        check("api random", bool(response["_json"]["note"]["id"]))
+        request_proxy.query = QueryParams({"exclude": response["_json"]["note"]["id"]})
+        response = await plugin.api_random_note()
+        check("api random excludes current", bool(response["_json"]["note"]["id"]))
+
+        # Web API: 内容签名
+        response = await plugin.api_signature()
+        check("api signature", "|" in response["_json"]["signature"])
+
+        # Web API: 周报素材
+        request_proxy.query = QueryParams({})
+        response = await plugin.api_weekly()
+        weekly = response["_json"]
+        check("api weekly", weekly["start"] <= weekly["end"] and "digest_md" in weekly)
+        request_proxy.query = QueryParams({"start": "不是日期"})
+        response = await plugin.api_weekly()
+        check("api weekly rejects bad date", "日期格式" in str(response.get("_error", "")))
+
+        # Web API: 全量 JSON 备份与恢复
+        response = await plugin.api_export_json()
+        backup = json.loads(response["_json"]["content"])
+        check(
+            "api export json",
+            backup["format"] == "lijian-backup" and backup["count"] >= 1,
+        )
+        check(
+            "api export json hides token",
+            "ai_token" not in json.dumps(backup.get("settings", {}), ensure_ascii=False),
+        )
+        request_proxy._body = backup
+        response = await plugin.api_import_json()
+        check("api import json", response["_json"]["updated"] >= 1)
+        request_proxy._body = {"notes": [{"body_md": "没 id"}, "垃圾"]}
+        response = await plugin.api_import_json()
+        check("api import json skips junk", response["_json"]["skipped"] == 2)
+
+        # Web API: 本地图片的文件名白名单
+        response = await plugin.api_get_media("../../etc/passwd")
+        check("api media rejects traversal", "非法" in str(response.get("_error", "")))
+        response = await plugin.api_get_media("a" * 32 + ".png")
+        check("api media missing 404", response.get("_status") == 404)
 
         # Web API: diary write + markdown + status + stats
         request_proxy._body = {"content_md": "页面上写的", "tags": ["页面"]}

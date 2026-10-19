@@ -1,5 +1,6 @@
 """璃笺插件冒烟测试：db + bridge server 端到端。"""
 import asyncio
+import json
 import sys
 import tempfile
 from datetime import datetime
@@ -276,6 +277,51 @@ async def test_bridge():
         db.close()
 
 
+def test_new_features():
+    """搜索、轻量列表、随机、区间、JSON 备份。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(Path(tmp) / "feat.sqlite3")
+        diary = db.create_note(
+            {
+                "title": "牡丹园",
+                "body_md": "今天去了曹州牡丹园看花",
+                "tags": ["游记"],
+                "kind": "diary",
+                "diary_date": "2026-10-18",
+            }
+        )
+        memo = db.create_note({"title": "买菜", "body_md": "牛奶 100%", "kind": "note"})
+
+        check("light list omits body", "body_md" not in db.list_notes(True, light=True)[0])
+        check("full list keeps body", "body_md" in db.list_notes(True)[0])
+
+        # 中文两个字也要能搜到，这是不用 FTS5 trigram 的原因
+        check("search cjk two chars", [n["title"] for n in db.search_notes("牡丹")] == ["牡丹园"])
+        check("search cjk place", [n["title"] for n in db.search_notes("曹州")] == ["牡丹园"])
+        check("search escapes %", [n["title"] for n in db.search_notes("100%")] == ["买菜"])
+        check("search by tag", [n["title"] for n in db.search_notes("游记")] == ["牡丹园"])
+        check("search empty returns all", len(db.search_notes("")) == 2)
+
+        picked = db.random_note(exclude_id=diary["id"])
+        check("random excludes", picked is not None and picked["id"] == memo["id"])
+        check("random kind filter", db.random_note(kind="diary")["id"] == diary["id"])
+
+        ranged = db.notes_in_range("2026-10-17", "2026-10-19")
+        check("range by diary_date", [n["title"] for n in ranged] == ["牡丹园"])
+
+        backup = db.export_json()
+        check("backup format", backup["format"] == "lijian-backup" and backup["count"] == 2)
+        check(
+            "backup hides token",
+            "ai_token" not in json.dumps(backup["settings"], ensure_ascii=False),
+        )
+        restored = db.import_json(backup)
+        check("restore overwrites in place", restored["updated"] == 2 and len(db.list_notes(True)) == 2)
+        junk = db.import_json({"notes": [{"body_md": "没有 id"}, "垃圾"]})
+        check("restore skips junk", junk["skipped"] == 2)
+        db.close()
+
+
 async def test_security_hardening():
     """库文件权限、安全响应头、SSE 反代透传、内部异常脱敏。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -378,6 +424,8 @@ if __name__ == "__main__":
     test_parse_markdown_heading_fallback()
     print("== 数据库 ==")
     test_database()
+    print("== 新功能 ==")
+    test_new_features()
     print("== 桥接接口 ==")
     asyncio.run(test_bridge())
     print("== 安全加固 ==")
