@@ -736,7 +736,9 @@ async function backupNow() {
     toast("正在备份…");
     const result = await bridge.apiPost("backup", {});
     const info = result.backup || {};
-    toast(`已备份 ${info.count || 0} 篇，${Math.round((info.bytes || 0) / 1024)} KB`);
+    const bytes = info.bytes || 0;
+    const size = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
+    toast(`已备份 ${info.count || 0} 篇，${size}`);
     await loadStatus();
   } catch (error) {
     toast("备份失败：" + error.message);

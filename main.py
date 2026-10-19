@@ -101,7 +101,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 
 
 @register(
@@ -313,7 +313,7 @@ class LijianPlugin(Star):
                     info = await asyncio.to_thread(self._run_backup)
                     logger.info(
                         f"璃笺自动备份完成: {info['file']}（{info['count']} 篇，"
-                        f"{info['bytes'] // 1024} KB）"
+                        f"{format_size(info['bytes'])}）"
                     )
             except asyncio.CancelledError:
                 raise
@@ -1293,6 +1293,15 @@ def excerpt_text(markdown: str, limit: int = 80) -> str:
     if len(text) > limit:
         text = text[:limit].rstrip() + "…"
     return text
+
+
+def format_size(num: int) -> str:
+    """小文件也别显示成 0 KB，看着像备份是空的。"""
+    if num < 1024:
+        return f"{num} B"
+    if num < 1024 * 1024:
+        return f"{num / 1024:.1f} KB"
+    return f"{num / (1024 * 1024):.2f} MB"
 
 
 def split_tags(value: str | list[str] | None) -> list[str]:
