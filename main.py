@@ -87,7 +87,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 
 
 @register(
@@ -751,6 +751,8 @@ class LijianPlugin(Star):
         media_dir = self._data_dir / MEDIA_DIR_NAME
         try:
             media_dir.mkdir(parents=True, exist_ok=True)
+            # 图片是日记配图，跟数据库一个待遇：同机其他用户不该能列目录。
+            os.chmod(media_dir, 0o700)
         except OSError as exc:
             return error_response(f"创建图片目录失败：{exc}")
 

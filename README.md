@@ -87,7 +87,7 @@
 ## 注意
 
 - 需要 AstrBot ≥ 4.16（书架页面依赖插件 Pages 与 Web API）。**已在 4.29.1 上实测通过**：
-  Web API 13 条路由的注册与匹配、handler 签名、Pages 目录约定、i18n key、配置 schema、版本号一致性，共 33 项。
+  Web API 22 条路由的注册与匹配、handler 签名、Pages 目录约定、i18n key、配置 schema、版本号一致性，共 42 项。
 - 升级 AstrBot 之后先跑一次自检，全绿再重载插件：
 
   ```bash
@@ -96,6 +96,13 @@
 
   脚本会自己向上找 AstrBot 源码根，不在 AstrBot 目录下也能跑；装在别处时用 `ASTRBOT_ROOT` 指定。
   它和 `test_main.py`（mock 框架，测插件自身逻辑）不同，检查的是真框架上的接入点有没有变。
+- 自测直接用脚本跑，不依赖 pytest（测试文件是 `check()` 风格，不是 pytest 用例）：
+
+  ```bash
+  <AstrBot路径>/venv/bin/python test_smoke.py   # 数据库 + 桥接端到端
+  <AstrBot路径>/venv/bin/python test_main.py    # mock 框架，测插件逻辑与 Web API
+  ```
+
 - 前端自检：`node check_bookshelf.js`，自带最小 DOM stub，不用装依赖。
   会跑一遍 `app.js`，验证初始化和图片地址拼接。
 - 依赖 `aiohttp`（插件目录 requirements.txt 已声明）。
@@ -122,6 +129,14 @@
 - **绑定到 `0.0.0.0`** 会让同网段的人拿着令牌就能读写，启动时会打警告。不需要就别改。
 
 ## 更新日志
+
+### v1.1.1
+
+- 修：`media/` 目录改为 `0700`。之前建出来是 `0755`，图片本身是 `0600`，
+  但同机其他用户仍能列目录看到有多少张图。
+- 清：删掉 `pytest.ini`。测试是 `check()` 脚本风格，不是 pytest 用例，
+  留着会让 `pytest` 收集 0 条、退出码 5，看着像失败。
+- 文档：测试怎么跑写进 README；兼容核验的路由数与项数改正（22 条 / 42 项）。
 
 ### v1.1.0
 
