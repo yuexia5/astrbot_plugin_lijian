@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import zipfile
@@ -58,7 +59,9 @@ except Exception:  # noqa: BLE001
     HAS_WEB_API = False
 
 PLUGIN_NAME = "astrbot_plugin_lijian"
-PLUGIN_VERSION = "1.0.2"
+# 单篇 Markdown 导入上限。日记再长也到不了这个量级，超过基本是误传大文件。
+MAX_IMPORT_BYTES = 8 * 1024 * 1024
+PLUGIN_VERSION = "1.0.3"
 
 
 @register(
@@ -143,6 +146,13 @@ class LijianPlugin(Star):
             port = int(self.config.get("bridge_port", 27176))
         except (TypeError, ValueError):
             port = 27176
+        if host not in ("127.0.0.1", "::1", "localhost"):
+            # 绑到 0.0.0.0 之后，同一网段的人拿着令牌就能读写日记。
+            # 这是用户自己选的，但得让他清楚现在是什么状态。
+            logger.warning(
+                f"璃笺本地接口监听在 {host}:{port}，"
+                "已超出本机范围，同网段可访问。若不需要请把 bridge_host 改回 127.0.0.1。"
+            )
         self._bridge = BridgeServer(self._db, host=host, port=port)
         if not self._bridge.start():
             logger.warning(
@@ -632,6 +642,7 @@ class LijianPlugin(Star):
                         f"{date_prefix(note)}-{safe_filename(note['title'])}.md",
                         markdown_for_note(note),
                     )
+            secure_temp_file(tmp)
         except Exception as exc:
             return error_response(str(exc))
         return file_response(str(tmp), filename="lijian-export.zip", content_type="application/zip")
@@ -647,10 +658,20 @@ class LijianPlugin(Star):
         try:
             from astrbot.api.web import PluginUploadFile
 
+            # 先落一个空文件再收紧权限，避免内容以 0644 落盘。
+            tmp.touch(mode=0o600, exist_ok=True)
+            secure_temp_file(tmp)
             if isinstance(upload, PluginUploadFile):
                 await upload.save(tmp)
             else:
                 tmp.write_bytes(upload.file.read())
+            secure_temp_file(tmp)
+            size = tmp.stat().st_size
+            if size > MAX_IMPORT_BYTES:
+                return error_response(
+                    f"文件太大（{size // 1024} KB），单篇导入上限 "
+                    f"{MAX_IMPORT_BYTES // 1024} KB"
+                )
             notes = self._db.import_markdown_files([str(tmp)])
         except Exception as exc:
             return error_response(str(exc))
@@ -703,6 +724,18 @@ def cleanup_temp_files(pattern: str, max_age_seconds: int = 3600) -> None:
                 item.unlink()
         except OSError:
             continue
+
+
+def secure_temp_file(path: Path) -> None:
+    """把临时文件收紧到 0600。
+
+    tempfile.gettempdir() 下建的文件默认跟随 umask，常见是 0644，
+    同机其他用户能直接读日记内容。导出包和导入中转都走这里。
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def split_tags(value: str | list[str] | None) -> list[str]:

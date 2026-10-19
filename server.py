@@ -48,6 +48,19 @@ def _error(message: str, status: int = 400) -> web.Response:
     return _json_response({"ok": False, "error": message}, status=status)
 
 
+@web.middleware
+async def _security_headers(request: web.Request, handler):
+    """给所有响应当上几顶安全帽。纯 JSON 接口也值当，成本几乎为零。"""
+    response = await handler(request)
+    # SSE 在 handler 内部就已经 prepare 并发头了，这时再改 headers 会炸。
+    if not response.prepared:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
 class BridgeServer:
     """在后台线程中运行的 aiohttp 桥接服务。"""
 
@@ -134,7 +147,10 @@ class BridgeServer:
             loop.close()
 
     async def _serve(self) -> None:
-        app = web.Application(client_max_size=16 * 1024 * 1024)
+        app = web.Application(
+            client_max_size=16 * 1024 * 1024,
+            middlewares=[_security_headers],
+        )
         app.router.add_route("*", "/api/v1/health", self._handle_health)
         app.router.add_route("*", "/api/v1/diary", self._handle_diary)
         app.router.add_route("*", "/api/v1/notes", self._handle_notes_list)
@@ -173,16 +189,30 @@ class BridgeServer:
         host = request.remote or ""
         return host in ("127.0.0.1", "::1", "localhost")
 
-    def _events_token_ok(self, request: web.Request) -> bool:
-        """SSE 认证：优先 header；query 令牌只接受来自本机的连接。
+    @staticmethod
+    def _behind_proxy(request: web.Request) -> bool:
+        """带着转发头说明前面还有一层反代。
 
-        EventSource 不能带自定义头，所以桌面端脚本会用 ?token=。
-        但令牌落在 URL 里会进反代和访问日志，因此只在回环地址上放行。
+        这时 remote 往往是 127.0.0.1（反代自己），单看它会把外网请求误判成本机，
+        query 里的令牌就会一路写进反代日志。所以有转发头一律不认 query 令牌。
+        """
+        return any(
+            request.headers.get(name)
+            for name in ("X-Forwarded-For", "X-Real-IP", "Forwarded")
+        )
+
+    def _events_token_ok(self, request: web.Request) -> bool:
+        """SSE 认证：优先 header；query 令牌只接受本机直连。
+
+        EventSource 不能带自定义头，所以本机脚本会用 ?token=。
+        但令牌落在 URL 里会进反代和访问日志，因此只在回环地址、且没经过反代时放行。
         """
         if self._authorized(request):
             return True
         query_token = request.query.get("token")
-        if not query_token or not self._is_loopback(request):
+        if not query_token:
+            return False
+        if not self._is_loopback(request) or self._behind_proxy(request):
             return False
         return hmac.compare_digest(str(query_token), self.token_provider())
 
@@ -287,7 +317,7 @@ class BridgeServer:
                 }
             )
         except Exception as exc:
-            return _error(str(exc))
+            return self._db_error(exc)
         return _ok(
             {
                 "note_id": note["id"],
@@ -315,7 +345,7 @@ class BridgeServer:
         try:
             notes = self.db.list_notes(include_archived)
         except Exception as exc:
-            return _error(str(exc))
+            return self._db_error(exc)
         return _ok(
             {
                 "notes": [
@@ -358,7 +388,7 @@ class BridgeServer:
                 }
             )
         except Exception as exc:
-            return _error(str(exc))
+            return self._db_error(exc)
         return _ok(
             {
                 "action": "created",
@@ -415,8 +445,24 @@ class BridgeServer:
                     }
                 )
         except Exception as exc:
-            return _error(str(exc), status=404 if "not found" in str(exc) else 400)
+            return self._db_error(exc)
         return _error("method not allowed", status=405)
 
     def _unauthorized(self) -> web.Response:
         return _json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    def _db_error(self, exc: Exception) -> web.Response:
+        """把异常转成对外消息。
+
+        数据层抛的 DatabaseError 和参数错误都是业务口径，照实回；
+        其余（sqlite 打不开、磁盘满之类）只记日志，对外统一 internal error，
+        免得把数据库路径、表结构这些东西回给调用方。
+        """
+        text = str(exc) or exc.__class__.__name__
+        is_business = exc.__class__.__name__ == "DatabaseError" or isinstance(
+            exc, (ValueError, KeyError)
+        )
+        if not is_business:
+            logger.warning("璃笺本地接口内部错误 %s: %s", exc.__class__.__name__, text)
+            return _error("internal error", status=500)
+        return _error(text, status=404 if "not found" in text else 400)

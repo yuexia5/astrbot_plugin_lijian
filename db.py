@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import sqlite3
 import threading
@@ -14,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
+
+logger = logging.getLogger("astrbot_plugin_lijian")
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -90,6 +94,24 @@ class Database:
 
     # ---------- 基础 ----------
 
+    def _persist(self) -> None:
+        """提交并顺手收紧文件权限。
+
+        sqlite 建库、建 WAL 都按 umask 走，常见是 0644，同机其他用户能直接读，
+        而 WAL/SHM 并不跟随主库权限，必须每次提交后重新设一遍。
+        """
+        self.conn.commit()
+        self._harden_permissions()
+
+    def _harden_permissions(self) -> None:
+        if not self.path:
+            return
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(f"{self.path}{suffix}", 0o600)
+            except OSError:
+                continue
+
     def migrate(self) -> None:
         with self._lock:
             self.conn.executescript(SCHEMA)
@@ -97,7 +119,7 @@ class Database:
                 "INSERT OR IGNORE INTO settings (key, value_json) VALUES ('theme', ?)",
                 (json.dumps("light"),),
             )
-            self.conn.commit()
+            self._persist()
 
     def close(self) -> None:
         with self._lock:
@@ -135,6 +157,12 @@ class Database:
             current = self._get_setting("ai_token")
             if seed:
                 token = seed.strip()
+                if len(token) < 16:
+                    logger.warning(
+                        "璃笺写入令牌只有 %d 个字符，容易被猜中；"
+                        "建议换成 24 位以上随机串（留空可自动生成）。",
+                        len(token),
+                    )
                 if current != token:
                     self._set_setting("ai_token", token)
                 return token
@@ -247,7 +275,7 @@ class Database:
                     now_ts,
                 ),
             )
-            self.conn.commit()
+            self._persist()
             return self.get_note(note_id)
 
     def update_note(self, note_id: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -281,7 +309,7 @@ class Database:
                     note_id,
                 ),
             )
-            self.conn.commit()
+            self._persist()
             return self.get_note(note_id)
 
     def archive_note(self, note_id: str, archived: bool = True) -> dict[str, Any]:
@@ -290,13 +318,13 @@ class Database:
                 "UPDATE notes SET archived = ?, updated_at = ? WHERE id = ?",
                 (1 if archived else 0, now(), note_id),
             )
-            self.conn.commit()
+            self._persist()
             return self.get_note(note_id)
 
     def delete_note(self, note_id: str) -> None:
         with self._lock:
             self.conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
-            self.conn.commit()
+            self._persist()
 
     def pin_note(self, note_id: str, pinned: bool = True) -> dict[str, Any]:
         with self._lock:
@@ -304,7 +332,7 @@ class Database:
                 "UPDATE notes SET pinned = ?, updated_at = ? WHERE id = ?",
                 (1 if pinned else 0, now(), note_id),
             )
-            self.conn.commit()
+            self._persist()
             return self.get_note(note_id)
 
     def save_tile_rect(self, note_id: str, rect: dict[str, Any]) -> dict[str, Any]:
@@ -313,7 +341,7 @@ class Database:
                 "UPDATE notes SET tile_rect_json = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(rect, ensure_ascii=False), now(), note_id),
             )
-            self.conn.commit()
+            self._persist()
             return self.get_note(note_id)
 
     # ---------- AI 写入（append_today / create） ----------
@@ -437,7 +465,7 @@ class Database:
             """,
             (str(uuid4()), note_id, source, json.dumps(payload, ensure_ascii=False), now()),
         )
-        self.conn.commit()
+        self._persist()
 
     def _note_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         tags = json.loads(row["tags_json"] or "[]")
@@ -481,7 +509,7 @@ class Database:
             """,
             (key, json.dumps(value)),
         )
-        self.conn.commit()
+        self._persist()
 
     def _get_setting_json(self, key: str) -> Any:
         row = self.conn.execute(
@@ -502,7 +530,7 @@ class Database:
             """,
             (key, json.dumps(value, ensure_ascii=False)),
         )
-        self.conn.commit()
+        self._persist()
 
 
 # ---------- Markdown 解析 / 生成（移植自 db.rs） ----------

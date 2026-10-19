@@ -74,12 +74,51 @@
 
 ## 注意
 
-- 需要 AstrBot ≥ 4.16（书架页面依赖插件 Pages 与 Web API），当前适配 4.29.1。
+- 需要 AstrBot ≥ 4.16（书架页面依赖插件 Pages 与 Web API）。**已在 4.29.1 上实测通过**：
+  Web API 13 条路由的注册与匹配、handler 签名、Pages 目录约定、i18n key、配置 schema、版本号一致性，共 33 项。
+- 升级 AstrBot 之后先跑一次自检，全绿再重载插件：
+
+  ```bash
+  <AstrBot路径>/venv/bin/python check_astrbot_compat.py
+  ```
+
+  脚本会自己向上找 AstrBot 源码根，不在 AstrBot 目录下也能跑；装在别处时用 `ASTRBOT_ROOT` 指定。
+  它和 `test_main.py`（mock 框架，测插件自身逻辑）不同，检查的是真框架上的接入点有没有变。
 - 依赖 `aiohttp`（插件目录 requirements.txt 已声明）。
 - 数据目录遵循 AstrBot 规范放在 `data/plugin_data/` 下，更新 / 重装插件不会丢数据。
 - 只面向本机使用，`bridge_host` 保持 `127.0.0.1`。
 
+## 安全说明
+
+日记是明文存进 SQLite 的，没有额外加密。下面几条是已经做到的，剩下的得靠使用环境。
+
+- **文件权限**：数据库和它的 `-wal` / `-shm` 每次提交后都收紧到 `0600`，
+  同机其他用户读不到。导出的 zip 和导入的中转文件同样是 `0600`，用完即删。
+- **写入令牌**：留空时自动生成 `lijian-<uuid4>`（122 位随机）。手填时如果短于 16 个字符，
+  启动日志会告警。校验用恒时比较，避免按响应时间猜。
+- **SSE 的 `?token=`**：只有「本机直连」才认。请求一旦带上 `X-Forwarded-For`、
+  `X-Real-IP` 或 `Forwarded`，说明前面有反代，query 令牌一律拒绝——否则令牌会进反代日志。
+  走 header 的 `Authorization: Bearer` 不受这个限制。
+- **响应头**：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、
+  `Referrer-Policy: no-referrer`、`Cache-Control: no-store`，SSE 连接除外。
+- **错误信息**：数据层的业务错误照实返回，其他异常一律 `internal error`，
+  原始信息只进日志，免得把库路径、表结构回给调用方。
+- **令牌可见性**：书架页面的状态接口会返回令牌明文，方便复制到别处用。
+  能打开 WebUI 就是管理员级别，这条按这个前提设计；如果 WebUI 暴露在公网，请先给 WebUI 加密码。
+- **绑定到 `0.0.0.0`** 会让同网段的人拿着令牌就能读写，启动时会打警告。不需要就别改。
+
 ## 更新日志
+
+### v1.0.3
+
+- 安全：数据库与 `-wal` / `-shm` 收紧到 `0600`，每次提交后复原（WAL 不跟随主库权限）。
+- 安全：导出 zip、导入中转文件也设 `0600`；单篇导入上限 8 MB。
+- 安全：SSE 的 query 令牌在带转发头时一律拒绝，堵住「反代把外网请求变成本机」的绕过。
+- 安全：响应补 `nosniff` / `DENY` / `no-referrer` / `no-store`。
+- 安全：桥接接口的内部异常不再原样回传，细节只进日志。
+- 安全：令牌短于 16 位时启动告警；`bridge_host` 非回环时打警告。
+- 仓库：删掉误提交的 `data/` 运行时目录；补 `.gitattributes`，`.gitignore` 扩充。
+- 工具：`check_astrbot_compat.py` 改为在临时目录里跑，不再往插件目录里生成文件。
 
 ### v1.0.2
 
@@ -95,3 +134,4 @@
 - 修：导入的临时文件随用随删，导出的旧 zip 自动清理。
 - 加固：令牌改为恒时比较；SSE 的 query 令牌只接受本机连接，去掉通配 CORS。
 - 杂项：统一版本号，补 `.gitignore`，README 数据目录改正。
+- 新增 `check_astrbot_compat.py`：在当前 AstrBot 上实测接入点，升级框架后先跑这个。

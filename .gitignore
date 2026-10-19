@@ -1,7 +1,46 @@
+# Python 缓存
 __pycache__/
 *.py[cod]
+*.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 数据库（日记是明文，绝不入库）
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# AstrBot 运行时产物
+# 插件被 import 时可能按 cwd 生成这些，别让它们混进仓库
+data/
+temp/
+logs/
+*.log
+
+# 导出与临时中转
+lijian-export-*.zip
+lijian-import-*.md
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 本地配置与密钥
+.env
+.env.*
+*.local.json
+secrets.json
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db

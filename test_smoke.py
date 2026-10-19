@@ -276,6 +276,76 @@ async def test_bridge():
         db.close()
 
 
+async def test_security_hardening():
+    """库文件权限、安全响应头、SSE 反代透传、内部异常脱敏。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(Path(tmp) / "sec.sqlite3")
+        token = db.ensure_ai_token("k" * 32)
+        db.create_note({"body_md": "私密内容", "title": "私密"})
+
+        # 日记是明文 sqlite，主库和 WAL/SHM 都不该给同机其他用户留读权限
+        modes = {
+            p.name: (p.stat().st_mode & 0o777)
+            for p in Path(tmp).iterdir()
+            if p.is_file()
+        }
+        check("db/wal/shm 0600", bool(modes) and all(m == 0o600 for m in modes.values()))
+
+        bridge = BridgeServer(db, host="127.0.0.1", port=0)
+        check("hardening bridge started", bridge.start())
+        port = bridge._site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{port}"
+        auth = {"Authorization": f"Bearer {token}"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{base}/api/v1/health") as resp:
+                check(
+                    "security headers",
+                    resp.headers.get("X-Content-Type-Options") == "nosniff"
+                    and resp.headers.get("X-Frame-Options") == "DENY"
+                    and resp.headers.get("Referrer-Policy") == "no-referrer",
+                )
+
+            # query 令牌在本机直连时仍然可用（EventSource 带不了 header）
+            async with session.get(f"{base}/api/v1/events?token={token}") as resp:
+                check("sse query token local ok", resp.status == 200)
+
+            # 有转发头就说明前面有反代，此时 query 令牌一律不认，
+            # 否则令牌会一路写进反代日志
+            for proxy_header in ("X-Forwarded-For", "X-Real-IP", "Forwarded"):
+                async with session.get(
+                    f"{base}/api/v1/events?token={token}",
+                    headers={proxy_header: "8.8.8.8"},
+                ) as resp:
+                    check(
+                        f"sse query token behind {proxy_header} rejected",
+                        resp.status == 401,
+                    )
+
+            # 内部异常不能被原样回给调用方
+            def boom(_note_id):
+                raise RuntimeError("unable to open database file: /home/secret/lijian.sqlite3")
+
+            original = db.get_note
+            db.get_note = boom
+            try:
+                async with session.get(
+                    f"{base}/api/v1/notes/abc12345", headers=auth
+                ) as resp:
+                    body = await resp.json(content_type=None)
+                    check(
+                        "internal error redacted",
+                        resp.status == 500
+                        and "secret" not in str(body)
+                        and body.get("error") == "internal error",
+                    )
+            finally:
+                db.get_note = original
+
+        bridge.stop()
+        db.close()
+
+
 def test_bridge_port_conflict():
     import socket
 
@@ -310,6 +380,8 @@ if __name__ == "__main__":
     test_database()
     print("== 桥接接口 ==")
     asyncio.run(test_bridge())
+    print("== 安全加固 ==")
+    asyncio.run(test_security_hardening())
     print("== 端口冲突 ==")
     test_bridge_port_conflict()
     print(f"\n全部通过（{PASS} 项检查）")
