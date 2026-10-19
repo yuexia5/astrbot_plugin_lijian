@@ -115,6 +115,13 @@ def test_database():
             kind_rejected = True
         check("invalid kind rejected", kind_rejected)
 
+        try:
+            db.write_diary_from_ai({"content_md": "x", "mode": "append"})
+            mode_rejected = False
+        except DatabaseError:
+            mode_rejected = True
+        check("invalid mode rejected", mode_rejected)
+
         sig_before = db.note_signature()
         db.create_note({"title": "签名", "body_md": "x", "kind": "note"})
         check("note signature changes", db.note_signature() != sig_before)

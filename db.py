@@ -325,6 +325,8 @@ class Database:
                 raise DatabaseError("content_md is required")
             diary_date = input_.get("diary_date") or local_today()
             mode = input_.get("mode") or "append_today"
+            if mode not in ("append_today", "create"):
+                raise DatabaseError("mode 必须是 append_today 或 create")
             if mode == "append_today":
                 existing = self._find_diary_by_date(diary_date)
                 if existing is not None:

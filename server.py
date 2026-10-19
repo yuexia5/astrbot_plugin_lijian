@@ -218,7 +218,8 @@ class BridgeServer:
                 await self._broadcast_sse({"type": "notes_changed"})
             self._sse_last_seen = signature
             self._sse_seeded = True
-            await asyncio.sleep(2)
+            # 没客户端时放慢轮询，别白烧 CPU
+            await asyncio.sleep(2 if self._sse_clients else 5)
 
     async def _broadcast_sse(self, data: dict[str, Any]) -> None:
         if not self._sse_clients:

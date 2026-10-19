@@ -24,20 +24,24 @@ from astrbot.api.star import Context, Star, register
 try:
     from .db import (
         Database,
+        DatabaseError,
         clean_tags,
         date_prefix,
         local_today,
         markdown_for_note,
+        normalize_kind,
         safe_filename,
     )
     from .server import BridgeServer
 except ImportError:
     from db import (
         Database,
+        DatabaseError,
         clean_tags,
         date_prefix,
         local_today,
         markdown_for_note,
+        normalize_kind,
         safe_filename,
     )
     from server import BridgeServer
@@ -522,9 +526,11 @@ class LijianPlugin(Star):
         payload = await request.json(default={})
         title = payload.get("title") or ""
         body_md = payload.get("body_md") or ""
-        kind = payload.get("kind") or ("diary" if payload.get("diary_date") else "note")
-        if kind not in ("note", "diary"):
-            return error_response("kind 必须是 note 或 diary")
+        kind_raw = payload.get("kind") or ("diary" if payload.get("diary_date") else "note")
+        try:
+            kind = normalize_kind(kind_raw)
+        except DatabaseError as exc:
+            return error_response(str(exc))
         try:
             note = self._db.create_note(
                 {
