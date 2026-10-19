@@ -1,5 +1,6 @@
 """模拟 AstrBot 运行时，验证 main.py 的插件类：注册、指令、工具、Web API、桥接。"""
 import asyncio
+import gzip
 import json
 import logging
 import socket
@@ -193,6 +194,11 @@ with tempfile.TemporaryDirectory() as tmp:
             "bridge_enabled": True,
             "token": "",
             "default_mode": "append_today",
+            # 备份指到临时目录，顺带验证「启动时补备份」这条路。
+            "backup_enabled": True,
+            "backup_dir": str(Path(tmp) / "backups"),
+            "backup_keep": 3,
+            "backup_hour": 0,
         }
     )
     ctx = Context()
@@ -205,11 +211,18 @@ with tempfile.TemporaryDirectory() as tmp:
     token = plugin._db.settings()["ai_token"]
     check("token auto generated", token.startswith("lijian-"))
     check("bridge running", plugin._bridge is not None and plugin._bridge.running)
-    check("web apis registered", len(ctx.registered) == 22)
+    check(
+        "backup created at startup",
+        len(list((Path(tmp) / "backups").glob("lijian-*.json.gz"))) == 1,
+    )
+    check("web apis registered", len(ctx.registered) == 26)
     routes = {route for route, _, _ in ctx.registered}
     check("route notes list", f"/astrbot_plugin_lijian/notes" in routes)
     check("route archive POST", f"/astrbot_plugin_lijian/notes/<note_id>/archive" in routes)
     check("route export all", f"/astrbot_plugin_lijian/export/all" in routes)
+    check("route on this day", f"/astrbot_plugin_lijian/on-this-day" in routes)
+    check("route backup now", f"/astrbot_plugin_lijian/backup" in routes)
+    check("route restore backup", f"/astrbot_plugin_lijian/import/backup" in routes)
 
     async def run_tools():
         # 工具
@@ -308,6 +321,71 @@ with tempfile.TemporaryDirectory() as tmp:
         request_proxy._body = {"notes": [{"body_md": "没 id"}, "垃圾"]}
         response = await plugin.api_import_json()
         check("api import json skips junk", response["_json"]["skipped"] == 2)
+
+        # Web API: 那年今天
+        plugin._db.create_note(
+            {
+                "title": "去年的今天",
+                "body_md": "# 旧标题\n\n那年今天写的正文。",
+                "kind": "diary",
+                "diary_date": "2025-10-19",
+            }
+        )
+        request_proxy.query = QueryParams({"date": "2026-10-19"})
+        response = await plugin.api_on_this_day()
+        otd = response["_json"]
+        check("api on-this-day", otd["count"] == 1 and otd["items"][0]["years_ago"] == 1)
+        check(
+            "api on-this-day excerpt strips markdown",
+            otd["items"][0]["excerpt"].startswith("那年今天写的正文"),
+            otd["items"][0]["excerpt"],
+        )
+        request_proxy.query = QueryParams({"date": "2026/10/19"})
+        response = await plugin.api_on_this_day()
+        check("api on-this-day rejects bad date", "日期格式" in str(response.get("_error", "")))
+
+        # Web API: 立即备份 + 列表 + 从 gz 恢复
+        # 恢复时的临时文件走 _data_dir，指到临时目录，别在 /tmp 里留东西。
+        plugin._data_dir = Path(tmp)
+        response = await plugin.api_backup_now()
+        info = response["_json"]["backup"]
+        backup_path = Path(tmp) / "backups" / info["file"]
+        check("api backup now writes file", backup_path.is_file() and info["bytes"] > 0)
+        check("api backup now counts notes", info["count"] >= 1)
+        response = await plugin.api_list_backups()
+        listing = response["_json"]
+        check("api backups list", len(listing["items"]) >= 2 and listing["keep"] == 3)
+        check("api backups last run recorded", bool(listing["last"].get("date")))
+        check(
+            "backup file is 0600",
+            (backup_path.stat().st_mode & 0o777) == 0o600,
+            oct(backup_path.stat().st_mode & 0o777),
+        )
+
+        # 超出保留份数的旧备份要被清掉
+        for index in range(5):
+            (Path(tmp) / "backups" / f"lijian-2020010{index}-000000.json.gz").write_bytes(b"old")
+        response = await plugin.api_backup_now()
+        kept = sorted((Path(tmp) / "backups").glob("lijian-*.json.gz"))
+        check("api backup prunes old files", len(kept) == 3, len(kept))
+        check("api backup keeps newest", kept[-1].name.startswith("lijian-2026"))
+
+        payload = json.loads(gzip.decompress(backup_path.read_bytes()).decode("utf-8"))
+        check("backup gz is valid json", payload.get("format") == "lijian-backup")
+
+        gz_upload = FakeUpload("ignored")
+        gz_upload.filename = "lijian-backup.json.gz"
+
+        async def save_gz(path, _payload=backup_path.read_bytes()):
+            Path(path).write_bytes(_payload)
+
+        gz_upload.save = save_gz
+        request_proxy._files = {"file": gz_upload}
+        response = await plugin.api_import_backup()
+        check("api import backup gz", response["_json"]["updated"] >= 1, response)
+        request_proxy._files = {}
+        response = await plugin.api_import_backup()
+        check("api import backup needs file", "缺少" in str(response.get("_error", "")))
 
         # Web API: 本地图片的文件名白名单
         response = await plugin.api_get_media("../../etc/passwd")

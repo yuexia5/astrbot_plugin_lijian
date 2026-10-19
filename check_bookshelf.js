@@ -55,7 +55,19 @@ const bridge = {
     }
     if (endpoint === "signature") return { signature: "1|x|0" };
     if (endpoint === "notes") return { notes: [] };
-    if (endpoint === "stats") return { notes: 0, words: 0 };
+    if (endpoint === "stats") return { notes: 0, words: 0, streak: 0 };
+    if (endpoint === "on-this-day")
+      return {
+        items: [
+          {
+            id: "n1",
+            title: "去年的今天",
+            years_ago: 1,
+            found_date: "2025-10-19",
+            excerpt: "那年今天写的正文。",
+          },
+        ],
+      };
     return {};
   },
   apiPost: async () => ({}),
@@ -119,6 +131,16 @@ setTimeout(() => {
     const probe = sandbox.__probe;
     check("status 被请求", calls.some(([m, e]) => m === "get" && e === "status"));
     check("notes 被请求", calls.some(([m, e]) => m === "get" && e === "notes"));
+    check("那年今天被请求", calls.some(([m, e]) => m === "get" && e === "on-this-day"));
+
+    const echo = document.getElementById("echoBar");
+    check("那年今天横幅显示", echo.hidden === false);
+    check(
+      "那年今天文案",
+      document.getElementById("echoWhen").textContent === "一年前的今天" &&
+        document.getElementById("echoTitle").textContent === "去年的今天",
+      document.getElementById("echoWhen").textContent
+    );
 
     const name = "a".repeat(32) + ".png";
     const url = probe.mediaUrl(name);

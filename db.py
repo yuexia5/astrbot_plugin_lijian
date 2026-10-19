@@ -12,7 +12,7 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -329,6 +329,70 @@ class Database:
             rows = self.conn.execute(sql, tuple(params)).fetchall()
             return [self._note_from_row(row) for row in rows]
 
+    def on_this_day(
+        self,
+        today: Optional[str] = None,
+        limit: int = 10,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        """往年的今天写过什么。
+
+        today 形如 YYYY-MM-DD。没有 diary_date 的条目按 created_at 的本地日期算，
+        这样导入进来的旧日记也能被翻出来。今年的今天不算「那年」，直接跳过。
+        """
+        day = str(today or local_today())[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+            raise DatabaseError("日期格式应为 YYYY-MM-DD")
+        month_day = day[5:10]
+        expr = "COALESCE(diary_date, date(created_at, 'localtime'))"
+        sql = f"SELECT *, {expr} AS _found_day FROM notes WHERE substr({expr}, 6, 5) = ?1"
+        params: list[Any] = [month_day]
+        if not include_archived:
+            sql += " AND archived = 0"
+        sql += " ORDER BY _found_day DESC"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            found = str(row["_found_day"] or "")[:10]
+            if len(found) != 10:
+                continue
+            if found[:4] == day[:4]:
+                continue
+            note = self._note_from_row(row)
+            note["found_date"] = found
+            note["years_ago"] = int(day[:4]) - int(found[:4])
+            results.append(note)
+            if len(results) >= max(1, int(limit)):
+                break
+        return results
+
+    def diary_streak(self, today: Optional[str] = None) -> int:
+        """连续写了多少天日记。
+
+        今天还没写就从昨天起算——早上刚起床还没动笔就显示「断了」太伤人。
+        只算未归档的日记；便签不算，那是随手记，不该撑起连续天数。
+        """
+        day = str(today or local_today())[:10]
+        expr = "COALESCE(diary_date, date(created_at, 'localtime'))"
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT DISTINCT {expr} AS d FROM notes "
+                "WHERE archived = 0 AND kind = 'diary'"
+            ).fetchall()
+        days = {str(row["d"])[:10] for row in rows if row["d"]}
+        try:
+            cursor = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DatabaseError("日期格式应为 YYYY-MM-DD") from exc
+        if cursor.isoformat() not in days:
+            cursor -= timedelta(days=1)
+        streak = 0
+        while cursor.isoformat() in days:
+            streak += 1
+            cursor -= timedelta(days=1)
+        return streak
+
     # ---------- 全量备份 ----------
 
     # 只导出这些设置项；令牌之类绝不进备份包。
@@ -637,6 +701,14 @@ class Database:
             total_words = 0
             for note in notes:
                 total_words += word_count(note["body_md"])
+            expr = "COALESCE(diary_date, date(created_at, 'localtime'))"
+            day_rows = self.conn.execute(
+                f"SELECT DISTINCT {expr} AS d FROM notes WHERE archived = 0"
+            ).fetchall()
+            day_list = sorted(str(row["d"])[:10] for row in day_rows if row["d"])
+            days = len(day_list)
+            first_date = day_list[0] if day_list else ""
+            streak = self.diary_streak()
             return {
                 "notes": len(notes),
                 "diaries": sum(1 for n in notes if n["kind"] == "diary"),
@@ -644,6 +716,9 @@ class Database:
                 "archived": archived,
                 "words": total_words,
                 "pinned": sum(1 for n in notes if n["pinned"]),
+                "days": days,
+                "streak": streak,
+                "first_date": first_date,
             }
 
     # ---------- 内部 ----------
@@ -694,6 +769,16 @@ class Database:
         if not light:
             data["body_md"] = row["body_md"]
         return data
+
+    def state_get(self, key: str, default: Any = None) -> Any:
+        """插件自己的运行状态（上次备份日期之类），跟桌面版设置分开命名空间。"""
+        with self._lock:
+            value = self._get_setting_json(f"state:{key}")
+        return default if value is None else value
+
+    def state_set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._set_setting_json(f"state:{key}", value)
 
     def _get_setting(self, key: str) -> Optional[str]:
         row = self.conn.execute(

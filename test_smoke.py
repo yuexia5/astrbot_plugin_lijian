@@ -277,6 +277,55 @@ async def test_bridge():
         db.close()
 
 
+def test_recall_and_streak():
+    """那年今天、连续天数、插件状态存取。"""
+    db = Database(memory=True)
+
+    def diary(day, title):
+        return db.create_note(
+            {"title": title, "body_md": f"{title}的正文", "kind": "diary", "diary_date": day}
+        )
+
+    diary("2026-10-19", "今天")
+    diary("2026-10-18", "昨天")
+    diary("2026-10-17", "前天")
+    diary("2026-10-15", "断档前")
+    db.create_note(
+        {"title": "便签", "body_md": "不算日记", "kind": "note", "diary_date": "2026-10-16"}
+    )
+    diary("2025-10-19", "去年今天")
+    diary("2024-10-19", "前年今天")
+    diary("2025-10-18", "去年昨天")
+    archived = diary("2023-10-19", "归档的那年今天")
+    db.archive_note(archived["id"])
+
+    items = db.on_this_day("2026-10-19")
+    check("on_this_day count", len(items) == 2)
+    check("on_this_day newest year first", items[0]["years_ago"] == 1)
+    check("on_this_day years_ago", [n["years_ago"] for n in items] == [1, 2])
+    check("on_this_day skips current year", all(n["found_date"] != "2026-10-19" for n in items))
+    check("on_this_day skips archived", all(n["title"] != "归档的那年今天" for n in items))
+    check(
+        "on_this_day includes archived when asked",
+        len(db.on_this_day("2026-10-19", include_archived=True)) == 3,
+    )
+    check("on_this_day empty on new date", db.on_this_day("2026-10-19") and db.on_this_day("2026-03-08") == [])
+    check("on_this_day limit", len(db.on_this_day("2026-10-19", limit=1)) == 1)
+
+    check("streak counts today back", db.diary_streak("2026-10-19") == 3)
+    # 今天还没写时从昨天起算，不能一早醒来就显示断了
+    check("streak falls back to yesterday", db.diary_streak("2026-10-20") == 3)
+    # 10-16 只有便签，不算日记，所以 17 号往回数一天就断了
+    check("streak ignores notes", db.diary_streak("2026-10-17") == 1)
+    check("streak zero when far away", db.diary_streak("2026-11-30") == 0)
+    check("stats exposes streak", db.stats()["streak"] == 3)
+
+    db.state_set("last_backup", {"date": "2026-10-19", "file": "x.json.gz"})
+    check("state roundtrip", db.state_get("last_backup")["file"] == "x.json.gz")
+    check("state default", db.state_get("nope", "d") == "d")
+    db.close()
+
+
 def test_new_features():
     """搜索、轻量列表、随机、区间、JSON 备份。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -431,6 +480,8 @@ if __name__ == "__main__":
     test_database()
     print("== 新功能 ==")
     test_new_features()
+    print("== 那年今天与连续天数 ==")
+    test_recall_and_streak()
     print("== 桥接接口 ==")
     asyncio.run(test_bridge())
     print("== 安全加固 ==")

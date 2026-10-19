@@ -3,13 +3,16 @@
 把桌面版璃笺（Tauri）的存储与写入接口移植进 AstrBot：
 - 指令：/lijian_status /lijian_write /lijian_list /lijian_read /lijian_delete
 - LLM 工具：write_lijian_diary / list_lijian_notes / read_lijian_note /
-  update_lijian_note / delete_lijian_note
+  update_lijian_note / delete_lijian_note / lijian_weekly
 - 本地写入接口：监听 127.0.0.1:27176，与桌面版璃笺 API 兼容
-- WebUI 页面：书架 (pages/bookshelf)
+- WebUI 页面：书架 (pages/bookshelf)，含那年今天、连续天数
+- 自动备份：每天把整库压成 .json.gz，放在数据目录的 backups/ 下，只留最近 N 份
 """
 
 from __future__ import annotations
 
+import asyncio
+import gzip
 import json
 import os
 import re
@@ -18,6 +21,7 @@ import time
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
@@ -82,6 +86,14 @@ MEDIA_MIME = {
 MEDIA_NAME_RE = re.compile(r"^[0-9a-f]{32}\.(?:png|jpg|jpeg|gif|webp)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# 自动备份：落在数据目录的 backups/ 下，只保留最近 N 份。
+BACKUP_DIR_NAME = "backups"
+BACKUP_KEEP_DEFAULT = 30
+BACKUP_HOUR_DEFAULT = 3
+# 备份文件是 gzip 过的 JSON，恢复时按魔数判断，不靠扩展名。
+MAX_BACKUP_BYTES = 64 * 1024 * 1024
+GZIP_MAGIC = b"\x1f\x8b"
+
 # 新建日记时套的模板。{date} 会替换成本地日期。
 DEFAULT_DIARY_TEMPLATE = (
     "**天气**：\n"
@@ -89,7 +101,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.2.0"
 
 
 @register(
@@ -104,6 +116,7 @@ class LijianPlugin(Star):
         self.config = config
         self._db: Database | None = None
         self._bridge: BridgeServer | None = None
+        self._backup_task: asyncio.Task | None = None
         self._data_dir = self._resolve_data_dir()
         try:
             self._open_database()
@@ -111,6 +124,7 @@ class LijianPlugin(Star):
             logger.error(f"璃笺数据库初始化失败: {exc}")
         if self._db is not None:
             self._start_bridge()
+            self._start_backup_service()
         if self._db is not None and HAS_WEB_API:
             self._register_web_apis()
 
@@ -188,6 +202,148 @@ class LijianPlugin(Star):
                 "写入仅能通过指令 / LLM 工具 / 书架页面进行。"
             )
 
+    # ---------- 自动备份 ----------
+
+    def _backup_enabled(self) -> bool:
+        try:
+            return bool(self.config.get("backup_enabled", True))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _backup_dir(self) -> Path:
+        configured = str(self.config.get("backup_dir", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return self._data_dir / BACKUP_DIR_NAME
+
+    def _backup_keep(self) -> int:
+        try:
+            keep = int(self.config.get("backup_keep", BACKUP_KEEP_DEFAULT))
+        except (TypeError, ValueError):
+            keep = BACKUP_KEEP_DEFAULT
+        return max(1, min(keep, 365))
+
+    def _backup_hour(self) -> int:
+        try:
+            hour = int(self.config.get("backup_hour", BACKUP_HOUR_DEFAULT))
+        except (TypeError, ValueError):
+            hour = BACKUP_HOUR_DEFAULT
+        return max(0, min(hour, 23))
+
+    def _backup_files(self) -> list[Path]:
+        directory = self._backup_dir()
+        try:
+            return sorted(
+                directory.glob("lijian-*.json.gz"),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+        except OSError:
+            return []
+
+    def _prune_backups(self) -> int:
+        """只留最近 keep 份。多删了没法找回，所以按文件名排序，不碰不认识的。"""
+        keep = self._backup_keep()
+        removed = 0
+        for path in self._backup_files()[keep:]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    def _run_backup(self) -> dict[str, Any]:
+        """立刻写一份全量备份。压缩后落盘，写完立即收紧权限。"""
+        db = self._require_db()
+        directory = self._backup_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        payload = db.export_json()
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = directory / f"lijian-{stamp}.json.gz"
+        # 同一秒里连按两次「立即备份」不能互相覆盖，加个序号。
+        counter = 1
+        while path.exists():
+            counter += 1
+            path = directory / f"lijian-{stamp}-{counter}.json.gz"
+        tmp = path.with_suffix(".tmp")
+        try:
+            with gzip.open(tmp, "wb") as handle:
+                handle.write(raw)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        pruned = self._prune_backups()
+        info = {
+            "file": path.name,
+            "count": payload.get("count", 0),
+            "bytes": path.stat().st_size if path.exists() else 0,
+            "pruned": pruned,
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            db.state_set("last_backup", {"date": local_today(), **info})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺备份状态写入失败: {exc}")
+        return info
+
+    def _backup_due(self) -> bool:
+        if not self._backup_enabled() or self._db is None:
+            return False
+        last = self._db.state_get("last_backup", {}) or {}
+        last_date = str(last.get("date", "")) if isinstance(last, dict) else ""
+        if last_date == local_today():
+            return False
+        return datetime.now().hour >= self._backup_hour()
+
+    async def _backup_loop(self) -> None:
+        """半小时看一次：今天还没备份、且已过设定的点钟，就补一份。"""
+        while True:
+            try:
+                if self._backup_due():
+                    info = await asyncio.to_thread(self._run_backup)
+                    logger.info(
+                        f"璃笺自动备份完成: {info['file']}（{info['count']} 篇，"
+                        f"{info['bytes'] // 1024} KB）"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"璃笺自动备份失败: {exc}")
+            await asyncio.sleep(1800)
+
+    def _start_backup_service(self) -> None:
+        if not self._backup_enabled():
+            logger.info("璃笺自动备份未启用（backup_enabled=false）")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # 没有事件循环的场合（脚本里直接 new 插件）就退化成同步补一次。
+            try:
+                if self._backup_due():
+                    self._run_backup()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"璃笺自动备份失败: {exc}")
+            return
+        self._backup_task = loop.create_task(self._backup_loop())
+
+    def _stop_backup_service(self) -> None:
+        if self._backup_task is not None:
+            self._backup_task.cancel()
+            self._backup_task = None
+
     def _register_web_apis(self) -> None:
         register = self.context.register_web_api
         register(f"/{PLUGIN_NAME}/notes", self.api_list_notes, ["GET"], "书架：列出条目")
@@ -205,6 +361,10 @@ class LijianPlugin(Star):
         register(f"/{PLUGIN_NAME}/export/json", self.api_export_json, ["GET"], "书架：全量 JSON 备份")
         register(f"/{PLUGIN_NAME}/import/json", self.api_import_json, ["POST"], "书架：从 JSON 备份恢复")
         register(f"/{PLUGIN_NAME}/random", self.api_random_note, ["GET"], "书架：随手翻一篇")
+        register(f"/{PLUGIN_NAME}/on-this-day", self.api_on_this_day, ["GET"], "书架：那年今天")
+        register(f"/{PLUGIN_NAME}/backups", self.api_list_backups, ["GET"], "书架：备份列表")
+        register(f"/{PLUGIN_NAME}/backup", self.api_backup_now, ["POST"], "书架：立即备份")
+        register(f"/{PLUGIN_NAME}/import/backup", self.api_import_backup, ["POST"], "书架：从备份文件恢复")
         register(f"/{PLUGIN_NAME}/weekly", self.api_weekly, ["GET"], "书架：周报素材")
         register(f"/{PLUGIN_NAME}/signature", self.api_signature, ["GET"], "书架：内容签名（轮询用）")
         register(f"/{PLUGIN_NAME}/media", self.api_upload_media, ["POST"], "书架：上传图片")
@@ -214,6 +374,7 @@ class LijianPlugin(Star):
         register(f"/{PLUGIN_NAME}/status", self.api_status, ["GET"], "书架：运行状态")
 
     async def terminate(self):
+        self._stop_backup_service()
         if self._bridge is not None:
             self._bridge.stop()
             self._bridge = None
@@ -708,6 +869,117 @@ class LijianPlugin(Star):
             return error_response("书架上还没有可翻的条目", status_code=404)
         return json_response({"note": note})
 
+    async def api_on_this_day(self):
+        """往年的今天。只回摘要，正文等点开再取。"""
+        if self._db is None:
+            return error_response("数据库不可用")
+        day = (request.query.get("date") or local_today()).strip()
+        if not DATE_RE.match(day):
+            return error_response("日期格式应为 YYYY-MM-DD")
+        try:
+            notes = self._db.on_this_day(day, limit=10)
+        except Exception as exc:
+            return error_response(str(exc))
+        items = []
+        for note in notes:
+            summary = self._summary(note)
+            summary["years_ago"] = note.get("years_ago")
+            summary["found_date"] = note.get("found_date")
+            summary["excerpt"] = excerpt_text(note.get("body_md") or "", 80)
+            items.append(summary)
+        return json_response({"date": day, "count": len(items), "items": items})
+
+    async def api_list_backups(self):
+        if self._db is None:
+            return error_response("数据库不可用")
+        items = []
+        for path in self._backup_files():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            items.append(
+                {
+                    "name": path.name,
+                    "size": stat.st_size,
+                    "mtime": int(stat.st_mtime),
+                }
+            )
+        return json_response(
+            {
+                "dir": str(self._backup_dir()),
+                "keep": self._backup_keep(),
+                "enabled": self._backup_enabled(),
+                "last": self._db.state_get("last_backup", {}),
+                "items": items,
+            }
+        )
+
+    async def api_backup_now(self):
+        if self._db is None:
+            return error_response("数据库不可用")
+        try:
+            info = await asyncio.to_thread(self._run_backup)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺手动备份失败: {exc}")
+            return error_response(f"备份失败：{exc}")
+        return json_response({"ok": True, "backup": info})
+
+    async def api_import_backup(self):
+        """从 .json 或 .json.gz 备份恢复。
+
+        前端不用解压，也不受 JSON 请求体大小限制；临时文件放大盘上，
+        这台机器的 /tmp 只有 10M，备份一旦超过就直接写不进去。
+        """
+        if self._db is None:
+            return error_response("数据库不可用")
+        files = await request.files()
+        upload = files.get("file") if files else None
+        if upload is None:
+            return error_response("缺少上传文件（字段名 file）")
+        tmp = self._data_dir / f".import-{uuid4().hex}.tmp"
+        try:
+            from astrbot.api.web import PluginUploadFile
+
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            tmp.touch(mode=0o600, exist_ok=True)
+            secure_temp_file(tmp)
+            if isinstance(upload, PluginUploadFile):
+                await upload.save(tmp)
+            else:
+                tmp.write_bytes(upload.file.read())
+            secure_temp_file(tmp)
+            size = tmp.stat().st_size
+            if size > MAX_BACKUP_BYTES:
+                return error_response(
+                    f"备份文件太大（{size // 1024 // 1024} MB），上限 "
+                    f"{MAX_BACKUP_BYTES // 1024 // 1024} MB"
+                )
+            raw = tmp.read_bytes()
+            if raw[:2] == GZIP_MAGIC:
+                try:
+                    raw = gzip.decompress(raw)
+                except OSError as exc:
+                    return error_response(f"压缩包解不开：{exc}")
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return error_response("不是合法的 JSON 备份")
+            result = self._db.import_json(payload)
+        except Exception as exc:  # noqa: BLE001
+            return error_response(str(exc))
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return json_response(
+            {
+                **result,
+                "message": f"新建 {result['created']}，覆盖 {result['updated']}，跳过 {result['skipped']}",
+            }
+        )
+
     async def api_signature(self):
         """给书架页轮询用：只回一行签名，比每次拉全表便宜得多。"""
         if self._db is None:
@@ -955,6 +1227,13 @@ class LijianPlugin(Star):
                 },
                 "token": self._db.settings()["ai_token"],
                 "stats": self._db.stats(),
+                "backup": {
+                    "enabled": self._backup_enabled(),
+                    "dir": str(self._backup_dir()),
+                    "keep": self._backup_keep(),
+                    "files": len(self._backup_files()),
+                    "last": self._db.state_get("last_backup", {}),
+                },
                 "diary_template": template,
                 # 前端拼图片地址时要用；拿不到就让它退回按 location 推。
                 "api_base": self._api_base(),
@@ -999,6 +1278,21 @@ def secure_temp_file(path: Path) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def excerpt_text(markdown: str, limit: int = 80) -> str:
+    """列表和横幅上用的纯文本摘要：去掉标题、图片、链接和标记。"""
+    text = str(markdown or "")
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    # 标题行整行去掉：横幅上已经有标题了，再来一遍只是重复。
+    text = re.sub(r"^\s{0,3}#{1,6}\s*.*$", " ", text, flags=re.MULTILINE)
+    text = re.sub(r"[*_>`~]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
 
 
 def split_tags(value: str | list[str] | None) -> list[str]:

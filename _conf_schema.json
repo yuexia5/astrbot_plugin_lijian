@@ -42,5 +42,29 @@
     "type": "text",
     "default": "**天气**：\n**心情**：\n\n## 今天做了什么\n\n- \n\n## 三件小事\n\n1. \n2. \n3. \n",
     "hint": "书架页点「新日记」时自动填入。{date} 会替换成当天日期；清空则新建空白日记。"
+  },
+  "backup_enabled": {
+    "description": "自动备份",
+    "type": "bool",
+    "default": true,
+    "hint": "每天自动把整个书库压成一份备份，放在数据目录的 backups/ 下。"
+  },
+  "backup_hour": {
+    "description": "备份时间（点）",
+    "type": "int",
+    "default": 3,
+    "hint": "每天这个点之后补一次备份，0-23。插件启动时如果发现当天还没备份，会立刻补。"
+  },
+  "backup_keep": {
+    "description": "备份保留份数",
+    "type": "int",
+    "default": 30,
+    "hint": "超过这个数量的旧备份自动删掉，1-365。"
+  },
+  "backup_dir": {
+    "description": "备份目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空放在插件数据目录的 backups/ 下；填路径可以放到别的大盘上。"
   }
 }

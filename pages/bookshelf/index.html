@@ -35,6 +35,7 @@
         <div class="menu" id="exportMenu" hidden>
           <button type="button" data-export="zip">全部 Markdown（zip）</button>
           <button type="button" data-export="json">全量 JSON 备份</button>
+          <button type="button" data-export="backup">立即备份到本地</button>
           <button type="button" data-export="restore">从 JSON 恢复…</button>
           <button type="button" data-export="weekly">复制本周素材</button>
         </div>
@@ -43,6 +44,17 @@
       <button class="btn ghost icon" id="settingsBtn" title="状态与写入令牌">⚙</button>
     </div>
   </header>
+
+  <section class="echo" id="echoBar" hidden>
+    <span class="echo-tag" id="echoTag">那年今天</span>
+    <button class="echo-card" id="echoCard" type="button">
+      <span class="echo-when" id="echoWhen"></span>
+      <span class="echo-title" id="echoTitle"></span>
+      <span class="echo-line" id="echoLine"></span>
+    </button>
+    <button class="echo-next" id="echoNext" type="button" hidden>换一篇</button>
+    <button class="echo-close" id="echoClose" type="button" aria-label="收起">×</button>
+  </section>
 
   <main class="shelves" id="shelves"></main>
 
@@ -103,7 +115,7 @@
 </section>
 
 <input type="file" id="imageInput" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
-<input type="file" id="jsonInput" accept="application/json,.json" hidden />
+<input type="file" id="jsonInput" accept="application/json,application/gzip,.json,.gz" hidden />
 
 <div class="toast" id="toast" hidden></div>
 

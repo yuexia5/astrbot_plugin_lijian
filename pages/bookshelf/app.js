@@ -17,6 +17,9 @@ const state = {
   signature: "",
   pollTimer: null,
   pendingRefresh: false,
+  otd: [],
+  otdIndex: 0,
+  otdDismissed: false,
 };
 
 const PALETTES = [
@@ -304,6 +307,59 @@ async function reload() {
   }
   renderShelf();
   updateStats();
+  loadEcho();
+}
+
+/* ---------------- 那年今天 ---------------- */
+
+function yearsWording(years) {
+  if (years === 1) return "一年前";
+  if (years === 2) return "两年前";
+  return `${years} 年前`;
+}
+
+async function loadEcho() {
+  if (state.otdDismissed) return;
+  try {
+    const result = await bridge.apiGet("on-this-day");
+    state.otd = Array.isArray(result.items) ? result.items : [];
+  } catch {
+    // 老版本后端没有这个接口，就当没有往事可翻，别在书架上留个报错条。
+    state.otd = [];
+  }
+  if (state.otdIndex >= state.otd.length) state.otdIndex = 0;
+  renderEcho();
+}
+
+function renderEcho() {
+  const bar = $("echoBar");
+  if (!state.otd.length || state.otdDismissed) {
+    bar.hidden = true;
+    return;
+  }
+  const item = state.otd[state.otdIndex];
+  bar.hidden = false;
+  $("echoWhen").textContent = `${yearsWording(item.years_ago)}的今天`;
+  $("echoTitle").textContent = item.title || "未命名";
+  $("echoLine").textContent = item.excerpt || "（这一页没有正文）";
+  $("echoNext").hidden = state.otd.length <= 1;
+}
+
+async function echoOpen() {
+  const item = state.otd[state.otdIndex];
+  if (!item || state.opening) return;
+  await openBook(null, item);
+}
+
+function echoNext() {
+  if (state.otd.length <= 1) return;
+  state.otdIndex = (state.otdIndex + 1) % state.otd.length;
+  renderEcho();
+}
+
+function echoClose() {
+  state.otdDismissed = true;
+  renderEcho();
 }
 
 async function updateStats() {
@@ -314,7 +370,9 @@ async function updateStats() {
   }
   try {
     const stats = await bridge.apiGet("stats");
-    $("statsText").textContent = `${stats.notes || 0} 册 · ${stats.words || 0} 字`;
+    const streak = Number(stats.streak || 0);
+    const tail = streak >= 2 ? ` · 连续 ${streak} 天` : "";
+    $("statsText").textContent = `${stats.notes || 0} 册 · ${stats.words || 0} 字${tail}`;
   } catch {
     $("statsText").textContent = "";
   }
@@ -643,25 +701,45 @@ async function exportJson() {
 
 async function restoreJson(file) {
   if (!file) return;
-  let data;
-  try {
-    data = JSON.parse(await file.text());
-  } catch {
-    toast("这个文件不是合法 JSON");
+  const gzipped = /\.gz$/i.test(file.name || "");
+  if (!gzipped) {
+    // 未压缩的先在本地数一遍，用户确认之后才真的写库。
+    let count = 0;
+    try {
+      const data = JSON.parse(await file.text());
+      count = Array.isArray(data && data.notes) ? data.notes.length : 0;
+    } catch {
+      toast("这个文件不是合法 JSON");
+      return;
+    }
+    if (!count) {
+      toast("备份里没有条目");
+      return;
+    }
+    if (!window.confirm(`将导入 ${count} 条，同 id 的会被覆盖。继续？`)) return;
+  } else if (!window.confirm("从压缩备份恢复？同 id 的条目会被覆盖。")) {
     return;
   }
-  const count = Array.isArray(data && data.notes) ? data.notes.length : 0;
-  if (!count) {
-    toast("备份里没有条目");
-    return;
-  }
-  if (!window.confirm(`将导入 ${count} 条，同 id 的会被覆盖。继续？`)) return;
   try {
-    const result = await bridge.apiPost("import/json", data);
-    toast(result.message || "导入完成");
+    // 交给后端解压：浏览器不引第三方库，也绕开 JSON 请求体的大小限制。
+    const result = await bridge.upload("import/backup", file);
+    toast(result.message || "恢复完成");
     await reload();
+    await loadStatus();
   } catch (error) {
     toast("恢复失败：" + error.message);
+  }
+}
+
+async function backupNow() {
+  try {
+    toast("正在备份…");
+    const result = await bridge.apiPost("backup", {});
+    const info = result.backup || {};
+    toast(`已备份 ${info.count || 0} 篇，${Math.round((info.bytes || 0) / 1024)} KB`);
+    await loadStatus();
+  } catch (error) {
+    toast("备份失败：" + error.message);
   }
 }
 
@@ -969,11 +1047,15 @@ async function openSettings() {
         ? `运行中 ${status.bridge.host}:${status.bridge.port}`
         : "未运行"
       : "未启用";
+    const backup = status.backup || {};
+    const lastBackup = backup.last && backup.last.at ? backup.last.at : "还没有";
     $("statusList").innerHTML = `
       <div><dt>名称</dt><dd>${escapeHtml(status.name || "璃笺")} v${escapeHtml(status.version || "")}</dd></div>
       <div><dt>数据库</dt><dd>${escapeHtml(status.db_path || "")}</dd></div>
       <div><dt>写入接口</dt><dd>${bridgeInfo}</dd></div>
-      <div><dt>条目</dt><dd>${status.stats ? status.stats.notes : "-"} 册</dd></div>
+      <div><dt>条目</dt><dd>${status.stats ? status.stats.notes : "-"} 册${status.stats && status.stats.streak >= 2 ? `，连续 ${status.stats.streak} 天` : ""}</dd></div>
+      <div><dt>自动备份</dt><dd>${backup.enabled === false ? "未启用" : `${backup.files || 0} 份，保留 ${backup.keep || 0} 份`}</dd></div>
+      <div><dt>上次备份</dt><dd>${escapeHtml(String(lastBackup))}</dd></div>
     `;
     $("tokenField").value = status.token || "";
   } catch (error) {
@@ -1010,6 +1092,9 @@ function bindEvents() {
   $("newBtn").addEventListener("click", () => newDiary());
   $("emptyNew").addEventListener("click", () => newDiary());
   $("randomBtn").addEventListener("click", () => randomBook());
+  $("echoCard").addEventListener("click", () => echoOpen());
+  $("echoNext").addEventListener("click", () => echoNext());
+  $("echoClose").addEventListener("click", () => echoClose());
 
   $("backBtn").addEventListener("click", () => closeBook());
   $("editBtn").addEventListener("click", () => (state.editing ? renderRead() : enterEdit()));
@@ -1045,6 +1130,7 @@ function bindEvents() {
     const action = button.dataset.export;
     if (action === "zip") await exportZip();
     else if (action === "json") await exportJson();
+    else if (action === "backup") await backupNow();
     else if (action === "restore") $("jsonInput").click();
     else if (action === "weekly") await copyWeekly();
   });
