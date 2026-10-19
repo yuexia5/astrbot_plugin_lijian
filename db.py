@@ -243,20 +243,45 @@ class Database:
         if not q:
             return self.list_notes(include_archived)
 
-        escaped = q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
-        pattern = f"%{escaped}%"
-        sql = (
-            "SELECT * FROM notes WHERE ("
-            "title LIKE ?1 ESCAPE '\\' OR body_md LIKE ?1 ESCAPE '\\' "
-            "OR tags_json LIKE ?1 ESCAPE '\\' OR diary_date LIKE ?1 ESCAPE '\\'"
-            ")"
-        )
+        clause, params = self._search_clause(q)
+        sql = "SELECT * FROM notes WHERE " + clause
         if not include_archived:
             sql += " AND archived = 0"
-        sql += " ORDER BY pinned DESC, updated_at DESC LIMIT ?2"
+        params = list(params)
+        params.append(max(1, int(limit)))
+        sql += f" ORDER BY pinned DESC, updated_at DESC LIMIT ?{len(params)}"
         with self._lock:
-            rows = self.conn.execute(sql, (pattern, max(1, int(limit)))).fetchall()
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
             return [self._note_from_row(row) for row in rows]
+
+    def search_count(self, q: str, include_archived: bool = False) -> int:
+        """命中总数。列表最多回 limit 条，页面据此提示“还有多少没显示”。"""
+        q = str(q or "").strip()
+        if not q:
+            return len(self.list_notes(include_archived, light=True))
+        clause, params = self._search_clause(q)
+        sql = "SELECT COUNT(*) AS n FROM notes WHERE " + clause
+        if not include_archived:
+            sql += " AND archived = 0"
+        with self._lock:
+            row = self.conn.execute(sql, tuple(params)).fetchone()
+            return int(row["n"]) if row is not None else 0
+
+    @staticmethod
+    def _search_clause(q: str) -> tuple[str, list[Any]]:
+        """空格分隔多个词时按“全都要命中”拼 WHERE，并把通配符转义掉。"""
+        terms = [term for term in re.split(r"\s+", q) if term]
+        clauses: list[str] = []
+        params: list[Any] = []
+        for term in terms:
+            escaped = term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+            params.append(f"%{escaped}%")
+            idx = len(params)
+            clauses.append(
+                f"(title LIKE ?{idx} ESCAPE '\\' OR body_md LIKE ?{idx} ESCAPE '\\' "
+                f"OR tags_json LIKE ?{idx} ESCAPE '\\' OR diary_date LIKE ?{idx} ESCAPE '\\')"
+            )
+        return " AND ".join(clauses), params
 
     def random_note(
         self,

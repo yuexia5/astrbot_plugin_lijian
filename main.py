@@ -61,6 +61,8 @@ except Exception:  # noqa: BLE001
     HAS_WEB_API = False
 
 PLUGIN_NAME = "astrbot_plugin_lijian"
+# 查询词列表最多回这么多条，超过就告诉前端一共多少。
+SEARCH_LIMIT = 200
 # 单篇 Markdown 导入上限。日记再长也到不了这个量级，超过基本是误传大文件。
 MAX_IMPORT_BYTES = 8 * 1024 * 1024
 
@@ -87,7 +89,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 
 
 @register(
@@ -582,15 +584,20 @@ class LijianPlugin(Star):
         kind = request.query.get("kind")
         q = (request.query.get("q") or "").strip()
         # 搜索下沉到 SQL：前端不用把整库正文拉下来再过滤。
+        matched = None
         if q:
             notes = self._db.search_notes(q, include_archived)
+            # 命中数超过一页时，告诉前端一共多少，别让人以为只剩这些。
+            if len(notes) >= SEARCH_LIMIT:
+                matched = self._db.search_count(q, include_archived)
         else:
             notes = self._db.list_notes(include_archived, light=light)
         if kind in ("diary", "note"):
             notes = [note for note in notes if note["kind"] == kind]
-        return json_response(
-            {"notes": [self._summary(note, include_body) for note in notes]}
-        )
+        payload = {"notes": [self._summary(note, include_body) for note in notes]}
+        if q:
+            payload["matched"] = matched if matched is not None else len(notes)
+        return json_response(payload)
 
     async def api_get_note(self, note_id: str):
         if self._db is None:

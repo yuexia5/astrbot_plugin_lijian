@@ -7,6 +7,7 @@ const state = {
   notes: [],
   tab: "all",
   q: "",
+  matched: 0,
   opening: false,
   current: null,
   editing: false,
@@ -295,15 +296,22 @@ async function reload() {
   try {
     const result = await fetchNotes(state.q);
     state.notes = Array.isArray(result.notes) ? result.notes : [];
+    state.matched = Number(result.matched || 0);
   } catch (error) {
     toast("读取书架失败：" + error.message);
     state.notes = [];
+    state.matched = 0;
   }
   renderShelf();
   updateStats();
 }
 
 async function updateStats() {
+  // 搜索命中超过一页时，明确说还有多少没显示，别让人以为书丢了。
+  if (state.q && state.matched > state.notes.length) {
+    $("statsText").textContent = `匹配 ${state.matched} 条，显示前 ${state.notes.length} 条`;
+    return;
+  }
   try {
     const stats = await bridge.apiGet("stats");
     $("statsText").textContent = `${stats.notes || 0} 册 · ${stats.words || 0} 字`;

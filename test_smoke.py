@@ -301,6 +301,11 @@ def test_new_features():
         check("search escapes %", [n["title"] for n in db.search_notes("100%")] == ["买菜"])
         check("search by tag", [n["title"] for n in db.search_notes("游记")] == ["牡丹园"])
         check("search empty returns all", len(db.search_notes("")) == 2)
+        # 多词按“全都要命中”，不是把整串当一个词
+        check("search multi term", [n["title"] for n in db.search_notes("曹州 牡丹")] == ["牡丹园"])
+        check("search multi term order", [n["title"] for n in db.search_notes("牡丹 曹州")] == ["牡丹园"])
+        check("search multi term miss", db.search_notes("曹州 买菜") == [])
+        check("search escapes underscore", db.search_notes("_") == [])
 
         picked = db.random_note(exclude_id=diary["id"])
         check("random excludes", picked is not None and picked["id"] == memo["id"])

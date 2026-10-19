@@ -177,9 +177,9 @@ def free_port():
 PASS = 0
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
     global PASS
-    assert cond, f"FAIL: {name}"
+    assert cond, f"FAIL: {name} {detail}"
     PASS += 1
     print(f"  ok - {name}")
 
@@ -243,6 +243,15 @@ with tempfile.TemporaryDirectory() as tmp:
         response = await plugin.api_list_notes()
         check("api list with body", "body_md" in response["_json"]["notes"][0])
 
+        # 搜索：命中数要回给前端，多词按 AND
+        request_proxy.query = QueryParams({"include_archived": "true", "q": "今天"})
+        response = await plugin.api_list_notes()
+        payload = response["_json"]
+        check("api search returns matched", payload.get("matched") == len(payload["notes"]))
+        request_proxy.query = QueryParams({"include_archived": "true", "q": "今天 开心"})
+        response = await plugin.api_list_notes()
+        check("api search multi term", len(response["_json"]["notes"]) <= 1)
+
         # Web API: create + update + archive + restore
         request_proxy._body = {"title": "页面便签", "body_md": "正文", "kind": "note", "tags": ["x"]}
         response = await plugin.api_create_note()
@@ -305,6 +314,61 @@ with tempfile.TemporaryDirectory() as tmp:
         check("api media rejects traversal", "非法" in str(response.get("_error", "")))
         response = await plugin.api_get_media("a" * 32 + ".png")
         check("api media missing 404", response.get("_status") == 404)
+
+        # Web API: 图片上传的成功路径（之前只测了拒绝分支）
+        media_root = Path(tmp) / "media_test"
+        plugin._data_dir = media_root
+        payload = b"\x89PNG\r\n\x1a\n" + b"0" * 1024
+
+        upload = FakeUpload("ignored")
+        upload.filename = "photo.png"
+
+        async def save_payload(path, _payload=payload):
+            Path(path).write_bytes(_payload)
+
+        upload.save = save_payload
+        request_proxy._files = {"file": upload}
+        response = await plugin.api_upload_media()
+        uploaded = response.get("_json") or {}
+        check("api upload media ok", bool(uploaded.get("name")), response)
+        check("api upload returns media path", str(uploaded.get("url", "")).startswith("media/"))
+
+        saved = media_root / "media" / str(uploaded.get("name"))
+        check("api upload file exists", saved.is_file())
+        check("api upload file is 0600", (saved.stat().st_mode & 0o777) == 0o600,
+              oct(saved.stat().st_mode & 0o777))
+        check("api media dir is 0700", ((media_root / "media").stat().st_mode & 0o777) == 0o700,
+              oct((media_root / "media").stat().st_mode & 0o777))
+        check("api upload size matches", saved.read_bytes() == payload)
+
+        response = await plugin.api_get_media(str(uploaded.get("name")))
+        check("api media read back", Path(response.get("_file", "")).is_file(), response)
+
+        bad = FakeUpload("x")
+        bad.filename = "evil.sh"
+        request_proxy._files = {"file": bad}
+        response = await plugin.api_upload_media()
+        check("api upload rejects suffix", "只支持" in str(response.get("_error", "")), response)
+
+        big = FakeUpload("x")
+        big.filename = "big.png"
+
+        async def save_big(path, _size=plugin_main.MAX_MEDIA_BYTES + 1):
+            Path(path).write_bytes(b"0" * _size)
+
+        big.save = save_big
+        request_proxy._files = {"file": big}
+        response = await plugin.api_upload_media()
+        check("api upload rejects oversize", "太大" in str(response.get("_error", "")), response)
+        check("api upload cleans oversize file",
+              not list((media_root / "media").glob("*"))[-1:] or
+              sum(1 for _ in (media_root / "media").iterdir()) == 1)
+
+        request_proxy._files = {}
+        response = await plugin.api_upload_media()
+        check("api upload needs file", "缺少" in str(response.get("_error", "")), response)
+        request_proxy._files = {}
+        plugin._data_dir = Path(tmp)
 
         # Web API: diary write + markdown + status + stats
         request_proxy._body = {"content_md": "页面上写的", "tags": ["页面"]}
