@@ -65,7 +65,19 @@ function fmtTime(iso) {
 }
 
 function noteDate(note) {
-  return note.diary_date || (note.created_at || "").slice(0, 10);
+  if (note.diary_date) return note.diary_date;
+  // created_at 是 UTC，直接截前 10 位在东八区凌晨会显示成前一天。
+  const date = new Date(note.created_at || "");
+  if (Number.isNaN(date.getTime())) return (note.created_at || "").slice(0, 10);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function splitTagList(value) {
+  return String(value || "")
+    .split(/[,，、;；]/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
 }
 
 function sourceLabel(note) {
@@ -274,7 +286,11 @@ function renderShelf() {
 
 async function reload() {
   try {
-    const result = await bridge.apiGet("notes", { include_archived: true });
+    // 带上正文，搜索才能真正命中内容（列表默认只回摘要）。
+    const result = await bridge.apiGet("notes", {
+      include_archived: true,
+      include_body: "1",
+    });
     state.notes = Array.isArray(result.notes) ? result.notes : [];
   } catch (error) {
     toast("读取书架失败：" + error.message);
@@ -455,7 +471,7 @@ async function saveEdit() {
   const note = state.current;
   if (!note) return;
   const title = $("readerTitle").value.trim() || "未命名";
-  const tags = $("editorTags").value.split(",").map((tag) => tag.trim()).filter(Boolean);
+  const tags = splitTagList($("editorTags").value);
   const diaryDate = $("editorDate").value || null;
   try {
     const result = await bridge.apiPost("notes/" + note.id, {

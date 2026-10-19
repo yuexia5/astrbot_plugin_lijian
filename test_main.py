@@ -220,6 +220,8 @@ with tempfile.TemporaryDirectory() as tmp:
         check("tool list", result["ok"] and len(result["notes"]) >= 2)
         result = json.loads(await plugin.read_lijian_note(None, note_id))
         check("tool read", result["ok"] and "今天很开心" in result["note"]["body_md"])
+        lines = [line async for line in plugin.lijian_read(AstrMessageEvent(), note_id[:8])]
+        check("command read by id prefix", "今天很开心" in lines[0])
         result = json.loads(await plugin.update_lijian_note(None, note_id, title="改名"))
         check("tool update", result["ok"] and result["note"]["title"] == "改名")
         result = json.loads(await plugin.delete_lijian_note(None, note_id))
@@ -235,6 +237,11 @@ with tempfile.TemporaryDirectory() as tmp:
         request_proxy.query = QueryParams({"include_archived": "true", "kind": "diary", "q": ""})
         response = await plugin.api_list_notes()
         check("api list", response["_json"]["notes"] and response["_json"]["notes"][0]["kind"] == "diary")
+        check("api list omits body by default", "body_md" not in response["_json"]["notes"][0])
+
+        request_proxy.query = QueryParams({"include_archived": "true", "include_body": "true"})
+        response = await plugin.api_list_notes()
+        check("api list with body", "body_md" in response["_json"]["notes"][0])
 
         # Web API: create + update + archive + restore
         request_proxy._body = {"title": "页面便签", "body_md": "正文", "kind": "note", "tags": ["x"]}

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from uuid import uuid4
@@ -21,10 +22,24 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .db import Database, date_prefix, markdown_for_note, now, safe_filename
+    from .db import (
+        Database,
+        clean_tags,
+        date_prefix,
+        local_today,
+        markdown_for_note,
+        safe_filename,
+    )
     from .server import BridgeServer
 except ImportError:
-    from db import Database, date_prefix, markdown_for_note, now, safe_filename
+    from db import (
+        Database,
+        clean_tags,
+        date_prefix,
+        local_today,
+        markdown_for_note,
+        safe_filename,
+    )
     from server import BridgeServer
 
 try:
@@ -39,13 +54,14 @@ except Exception:  # noqa: BLE001
     HAS_WEB_API = False
 
 PLUGIN_NAME = "astrbot_plugin_lijian"
+PLUGIN_VERSION = "1.0.2"
 
 
 @register(
     PLUGIN_NAME,
     "璃笺",
     "无头环境下运行的璃笺日记库：AI 写入、指令管理、书架页面。",
-    "1.0.0",
+    PLUGIN_VERSION,
 )
 class LijianPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -84,7 +100,9 @@ class LijianPlugin(Star):
             db_path = self._data_dir / "lijian.sqlite3"
         self._db = Database(db_path)
         self._db.ensure_ai_token(str(self.config.get("token", "") or ""))
-        if not self._db.list_notes(False):
+        # 只有库彻底为空时才放第一篇。用 include_archived=True 判断，
+        # 否则用户把笔记全部归档后重载插件，又会冒出一篇「第一笺」。
+        if not self._db.list_notes(True):
             self._seed_first_note()
         logger.info(f"璃笺数据库已打开: {db_path}")
 
@@ -100,7 +118,7 @@ class LijianPlugin(Star):
                         "试着对 AI 说「把今天的总结写进日记」，或打开 WebUI 里的书架页面。"
                     ),
                     "kind": "diary",
-                    "diary_date": now()[:10],
+                    "diary_date": local_today(),
                     "tags": ["璃笺"],
                     "source": "local",
                 }
@@ -170,8 +188,8 @@ class LijianPlugin(Star):
         )
 
     @staticmethod
-    def _summary(note: dict) -> dict:
-        return {
+    def _summary(note: dict, include_body: bool = False) -> dict:
+        summary = {
             "id": note["id"],
             "title": note["title"],
             "kind": note["kind"],
@@ -183,6 +201,9 @@ class LijianPlugin(Star):
             "created_at": note["created_at"],
             "updated_at": note["updated_at"],
         }
+        if include_body:
+            summary["body_md"] = note.get("body_md", "")
+        return summary
 
     # ---------- 指令 ----------
 
@@ -458,6 +479,12 @@ class LijianPlugin(Star):
             "true",
             "yes",
         )
+        # 书架页要在本地搜正文，所以允许把 body_md 一起带回来。
+        include_body = request.query.get("include_body", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         kind = request.query.get("kind")
         q = (request.query.get("q") or "").strip().lower()
         notes = self._db.list_notes(include_archived)
@@ -477,7 +504,9 @@ class LijianPlugin(Star):
                     ]
                 ).lower()
             ]
-        return json_response({"notes": [self._summary(note) for note in notes]})
+        return json_response(
+            {"notes": [self._summary(note, include_body) for note in notes]}
+        )
 
     async def api_get_note(self, note_id: str):
         if self._db is None:
@@ -586,6 +615,8 @@ class LijianPlugin(Star):
     async def api_export_all(self):
         if self._db is None:
             return error_response("数据库不可用")
+        # 导出后的 zip 要留到浏览器下载完，不能立刻删；顺手清掉一小时前的旧包。
+        cleanup_temp_files("lijian-export-*.zip")
         tmp = Path(tempfile.gettempdir()) / f"lijian-export-{uuid4().hex}.zip"
         notes = self._db.list_notes(False)
         try:
@@ -606,10 +637,10 @@ class LijianPlugin(Star):
         upload = files.get("file") if files else None
         if upload is None:
             return error_response("缺少上传文件（字段名 file）")
+        tmp = Path(tempfile.gettempdir()) / f"lijian-import-{uuid4().hex}.md"
         try:
             from astrbot.api.web import PluginUploadFile
 
-            tmp = Path(tempfile.gettempdir()) / f"lijian-import-{uuid4().hex}.md"
             if isinstance(upload, PluginUploadFile):
                 await upload.save(tmp)
             else:
@@ -617,6 +648,12 @@ class LijianPlugin(Star):
             notes = self._db.import_markdown_files([str(tmp)])
         except Exception as exc:
             return error_response(str(exc))
+        finally:
+            # 已经读进数据库了，临时文件立刻删掉，别在 /tmp 里越攒越多。
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         return json_response({"notes": [self._summary(note) for note in notes], "count": len(notes)})
 
     async def api_stats(self):
@@ -633,7 +670,7 @@ class LijianPlugin(Star):
             {
                 "ok": True,
                 "name": "璃笺",
-                "version": "1.0.0",
+                "version": PLUGIN_VERSION,
                 "db_path": self._db.path,
                 "bridge": {
                     "enabled": self._bridge is not None,
@@ -647,9 +684,21 @@ class LijianPlugin(Star):
         )
 
 
+def cleanup_temp_files(pattern: str, max_age_seconds: int = 3600) -> None:
+    """删掉临时目录里超过 max_age_seconds 的旧文件，失败就跳过。"""
+    cutoff = time.time() - max_age_seconds
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob(pattern))
+    except OSError:
+        return
+    for item in candidates:
+        try:
+            if item.is_file() and item.stat().st_mtime < cutoff:
+                item.unlink()
+        except OSError:
+            continue
+
+
 def split_tags(value: str | list[str] | None) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(item).strip().lstrip("#") for item in value if str(item).strip()]
-    return [item.strip().lstrip("#") for item in value.split(",") if item.strip()]
+    """标签解析交给数据层，统一支持中英文逗号、顿号、分号。"""
+    return clean_tags(value)

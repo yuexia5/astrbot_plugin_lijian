@@ -2,7 +2,8 @@
 
 - GET    /api/v1/health
 - POST   /api/v1/diary           （Bearer 令牌）
-- GET    /api/v1/notes           （Bearer 令牌，?include_archived=true）
+- GET    /api/v1/notes           （Bearer 令牌，?include_archived=true&include_body=true）
+- POST   /api/v1/notes           （Bearer 令牌，新建便签）
 - GET    /api/v1/notes/{id}      （Bearer 令牌）
 - PATCH  /api/v1/notes/{id}      （Bearer 令牌）
 - DELETE /api/v1/notes/{id}      （Bearer 令牌，归档）
@@ -13,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import threading
 from typing import Any, Callable, Optional
@@ -66,6 +68,10 @@ class BridgeServer:
         self._site: Optional[web.TCPSite] = None
         self._ready = threading.Event()
         self._start_error: Optional[str] = None
+        self._sse_clients: set[asyncio.Queue] = set()
+        self._sse_last_seen: Optional[str] = None
+        self._sse_seeded = False
+        self._watcher_task: Optional[asyncio.Task] = None
 
     @property
     def running(self) -> bool:
@@ -75,6 +81,9 @@ class BridgeServer:
         if self._thread and self._thread.is_alive():
             return True
         self._start_error = None
+        # 重启用同一个 BridgeServer 时必须清掉上一次的就绪标记，
+        # 否则第二次启动会在服务真正起来之前就返回成功。
+        self._ready.clear()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run, name="lijian-bridge", daemon=True
@@ -130,12 +139,24 @@ class BridgeServer:
         app.router.add_route("*", "/api/v1/diary", self._handle_diary)
         app.router.add_route("*", "/api/v1/notes", self._handle_notes_list)
         app.router.add_route("*", "/api/v1/notes/{note_id}", self._handle_note)
+        app.router.add_route("GET", "/api/v1/events", self._handle_events)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)
         await self._site.start()
+        self._watcher_task = asyncio.create_task(self._watch_notes())
 
     async def _shutdown(self) -> None:
+        if self._watcher_task:
+            self._watcher_task.cancel()
+            try:
+                await self._watcher_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._watcher_task = None
+        for queue in list(self._sse_clients):
+            queue.put_nowait(None)
+        self._sse_clients.clear()
         if self._site:
             await self._site.stop()
         if self._runner:
@@ -146,7 +167,24 @@ class BridgeServer:
     def _authorized(self, request: web.Request) -> bool:
         auth = request.headers.get("Authorization", "")
         expected = f"Bearer {self.token_provider()}"
-        return auth == expected
+        return hmac.compare_digest(auth, expected)
+
+    def _is_loopback(self, request: web.Request) -> bool:
+        host = request.remote or ""
+        return host in ("127.0.0.1", "::1", "localhost")
+
+    def _events_token_ok(self, request: web.Request) -> bool:
+        """SSE 认证：优先 header；query 令牌只接受来自本机的连接。
+
+        EventSource 不能带自定义头，所以桌面端脚本会用 ?token=。
+        但令牌落在 URL 里会进反代和访问日志，因此只在回环地址上放行。
+        """
+        if self._authorized(request):
+            return True
+        query_token = request.query.get("token")
+        if not query_token or not self._is_loopback(request):
+            return False
+        return hmac.compare_digest(str(query_token), self.token_provider())
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return _ok(
@@ -155,12 +193,75 @@ class BridgeServer:
                 "endpoints": [
                     "POST /api/v1/diary",
                     "GET /api/v1/notes",
+                    "POST /api/v1/notes",
                     "GET /api/v1/notes/{id}",
                     "PATCH /api/v1/notes/{id}",
                     "DELETE /api/v1/notes/{id}",
+                    "GET /api/v1/events",
                 ],
             }
         )
+
+    # ---------- SSE 实时推送 ----------
+
+    async def _watch_notes(self) -> None:
+        """每 2 秒取一次书架签名，变化就广播给所有 SSE 客户端。
+
+        用条数 + 最新更新时间 + 归档数做签名，比逐条拉 id/updated_at 轻。
+        """
+        while True:
+            try:
+                signature = self.db.note_signature()
+            except Exception:  # noqa: BLE001
+                signature = None
+            if self._sse_seeded and signature != self._sse_last_seen:
+                await self._broadcast_sse({"type": "notes_changed"})
+            self._sse_last_seen = signature
+            self._sse_seeded = True
+            await asyncio.sleep(2)
+
+    async def _broadcast_sse(self, data: dict[str, Any]) -> None:
+        if not self._sse_clients:
+            return
+        import json
+
+        payload = f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        for queue in list(self._sse_clients):
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+    async def _handle_events(self, request: web.Request) -> web.StreamResponse:
+        if not self._events_token_ok(request):
+            return self._unauthorized()
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await resp.prepare(request)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._sse_clients.add(queue)
+        try:
+            await resp.write(b": connected\n\n")
+            while True:
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    await resp.write(b": ping\n\n")
+                    continue
+                if message is None:
+                    break
+                await resp.write(message.encode("utf-8"))
+        except (asyncio.CancelledError, ConnectionResetError, ConnectionError):
+            pass
+        finally:
+            self._sse_clients.discard(queue)
+        return resp
 
     async def _handle_diary(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
@@ -197,7 +298,15 @@ class BridgeServer:
     async def _handle_notes_list(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
             return self._unauthorized()
+        method = request.method.upper()
+        if method == "POST":
+            return await self._handle_notes_create(request)
         include_archived = request.query.get("include_archived", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        include_body = request.query.get("include_body", "false").lower() in (
             "1",
             "true",
             "yes",
@@ -219,9 +328,40 @@ class BridgeServer:
                         "archived": note["archived"],
                         "created_at": note["created_at"],
                         "updated_at": note["updated_at"],
+                        **({"body_md": note["body_md"]} if include_body else {}),
                     }
                     for note in notes
                 ]
+            }
+        )
+
+    async def _handle_notes_create(self, request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error("invalid json body")
+        if not isinstance(payload, dict):
+            return _error("invalid json body")
+        body_md = payload.get("body_md") or payload.get("content_md")
+        if not isinstance(body_md, str):
+            return _error("body_md is required")
+        try:
+            note = self.db.create_note(
+                {
+                    "body_md": body_md,
+                    "title": payload.get("title") or None,
+                    "kind": payload.get("kind") or "note",
+                    "diary_date": payload.get("diary_date") or None,
+                    "tags": payload.get("tags") or [],
+                    "source": payload.get("source") or "astrbot",
+                }
+            )
+        except Exception as exc:
+            return _error(str(exc))
+        return _ok(
+            {
+                "action": "created",
+                "note": note,
             }
         )
 
@@ -250,9 +390,12 @@ class BridgeServer:
                     return _error("invalid json body")
                 if not payload:
                     return _error("at least one field is required")
+                body_value = payload.get("content_md")
+                if body_value is None:
+                    body_value = payload.get("body_md")
                 patch = {
                     "title": payload.get("title"),
-                    "body_md": payload.get("content_md") or payload.get("body_md"),
+                    "body_md": body_value,
                     "kind": payload.get("kind"),
                     "tags": payload.get("tags"),
                 }

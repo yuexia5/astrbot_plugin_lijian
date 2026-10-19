@@ -59,6 +59,15 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def local_today() -> str:
+    """本地时区的今天（YYYY-MM-DD）。
+
+    日记的默认日期必须按本地时区算：UTC 日期在东八区凌晨 0-8 点会落到前一天，
+    直接用 UTC 会让「今天的日记」写进昨天那一篇。
+    """
+    return datetime.now().astimezone().date().isoformat()
+
+
 class DatabaseError(Exception):
     pass
 
@@ -97,14 +106,41 @@ class Database:
             except sqlite3.Error:
                 pass
 
+    def list_note_timestamps(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [
+                {"id": row["id"], "updated_at": row["updated_at"]}
+                for row in self.conn.execute(
+                    "SELECT id, updated_at FROM notes"
+                ).fetchall()
+            ]
+
+    def note_signature(self) -> str:
+        """书架内容签名（条数 + 最新更新时间 + 归档数），供 SSE 轮询比对。
+
+        比逐条拉 id/updated_at 便宜得多，编辑、归档、删除都会改变签名。
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "COALESCE(MAX(updated_at), '') AS latest, "
+                "COALESCE(SUM(archived), 0) AS archived FROM notes"
+            ).fetchone()
+            return f"{row['total']}|{row['latest']}|{row['archived']}"
+
     # ---------- 设置 ----------
 
     def ensure_ai_token(self, seed: str = "") -> str:
         with self._lock:
             current = self._get_setting("ai_token")
+            if seed:
+                token = seed.strip()
+                if current != token:
+                    self._set_setting("ai_token", token)
+                return token
             if current:
                 return current
-            token = (seed or f"lijian-{uuid4()}").strip()
+            token = f"lijian-{uuid4()}"
             self._set_setting("ai_token", token)
             return token
 
@@ -163,10 +199,22 @@ class Database:
             return [self._note_from_row(row) for row in rows]
 
     def get_note(self, note_id: str) -> dict[str, Any]:
+        """按 id 读取；也接受唯一的 id 前缀（指令里只显示 8 位）。"""
+        note_id = str(note_id or "").strip()
+        if not note_id:
+            raise DatabaseError("note id 不能为空")
         with self._lock:
             row = self.conn.execute(
                 "SELECT * FROM notes WHERE id = ?1", (note_id,)
             ).fetchone()
+            if row is None and len(note_id) >= 6:
+                rows = self.conn.execute(
+                    "SELECT * FROM notes WHERE substr(id, 1, ?1) = ?2 LIMIT 2",
+                    (len(note_id), note_id),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise DatabaseError("note id 前缀不唯一，请给更长的 id")
+                row = rows[0] if rows else None
             if row is None:
                 raise DatabaseError("note not found")
             return self._note_from_row(row)
@@ -177,9 +225,9 @@ class Database:
             note_id = str(uuid4())
             body = str(input_.get("body_md") or "")
             title = normalize_title(input_.get("title"), body)
-            kind = input_.get("kind") or "note"
+            kind = normalize_kind(input_.get("kind"))
             source = input_.get("source") or "local"
-            tags = clean_tags(list(input_.get("tags") or []))
+            tags = clean_tags(input_.get("tags"))
             diary_date = input_.get("diary_date")
             self.conn.execute(
                 """
@@ -205,14 +253,17 @@ class Database:
     def update_note(self, note_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             existing = self.get_note(note_id)
-            title = patch.get("title") if patch.get("title") is not None else existing["title"]
+            title = patch["title"] if patch.get("title") else existing["title"]
             body = patch.get("body_md") if patch.get("body_md") is not None else existing["body_md"]
-            kind = patch.get("kind") if patch.get("kind") is not None else existing["kind"]
-            diary_date = (
-                patch["diary_date"]
-                if "diary_date" in patch and patch["diary_date"] is not None
-                else existing["diary_date"]
+            kind = (
+                normalize_kind(patch.get("kind"))
+                if patch.get("kind") is not None
+                else existing["kind"]
             )
+            if "diary_date" in patch:
+                diary_date = patch["diary_date"] or None
+            else:
+                diary_date = existing["diary_date"]
             tags = patch.get("tags") if patch.get("tags") is not None else existing["tags"]
             self.conn.execute(
                 """
@@ -272,7 +323,7 @@ class Database:
             content_md = str(input_.get("content_md") or "").strip()
             if not content_md:
                 raise DatabaseError("content_md is required")
-            diary_date = input_.get("diary_date") or datetime.now(timezone.utc).date().isoformat()
+            diary_date = input_.get("diary_date") or local_today()
             mode = input_.get("mode") or "append_today"
             if mode == "append_today":
                 existing = self._find_diary_by_date(diary_date)
@@ -285,7 +336,11 @@ class Database:
                             "body_md": f"{existing['body_md']}{separator}{content_md}",
                             "kind": "diary",
                             "diary_date": diary_date,
-                            "tags": input_.get("tags") or existing["tags"],
+                            # 追加时合并标签：AI 每次带 AstrBot/日记 不该冲掉用户手写的标签
+                            "tags": clean_tags(
+                                list(existing.get("tags") or [])
+                                + clean_tags(input_.get("tags"))
+                            ),
                         },
                     )
                     self._record_write_event(updated["id"], "astrbot", input_)
@@ -520,13 +575,35 @@ def first_markdown_heading(body: str) -> Optional[str]:
     return None
 
 
-def clean_tags(tags: list[Any]) -> list[str]:
+TAG_SPLIT = re.compile(r"[,，、;；]+")
+
+
+def clean_tags(tags: list[Any] | str | None) -> list[str]:
+    """清理标签：去 #、去重，并兼容中英文逗号 / 顿号 / 分号分隔。
+
+    LLM 和用户经常写「日记，日常」，只按英文逗号切会把整串当成一个标签。
+    """
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        tags = [tags]
     result: list[str] = []
     for tag in tags:
-        tag = str(tag).strip().lstrip("#")
-        if tag and tag not in result:
-            result.append(tag)
+        for piece in TAG_SPLIT.split(str(tag)):
+            piece = piece.strip().lstrip("#").strip()
+            if piece and piece not in result:
+                result.append(piece)
     return result
+
+
+def normalize_kind(value: Any) -> str:
+    """把 note / diary（含中文写法）归一，非法值直接报错。"""
+    kind = str(value or "note").strip().lower()
+    if kind in ("diary", "日记"):
+        return "diary"
+    if kind in ("note", "便签", "笔记"):
+        return "note"
+    raise DatabaseError("kind 必须是 note 或 diary")
 
 
 def yaml_string(value: str) -> str:
