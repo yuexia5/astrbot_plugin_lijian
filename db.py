@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import sqlite3
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-logger = logging.getLogger("astrbot_plugin_lijian")
+from astrbot.api import logger
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;

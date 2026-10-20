@@ -19,6 +19,12 @@ DEFAULT_DB = Path(
 REAL_DB = Path(os.environ.get("LIJIAN_DB", str(DEFAULT_DB)))
 sys.path.insert(0, str(PLUGIN))
 
+# db/server 用的是 AstrBot 官方 logger，脱开 AstrBot 进程跑测试时把源码根目录挂进来
+for _p in PLUGIN.parents:
+    if (_p / "astrbot" / "api" / "__init__.py").is_file():
+        sys.path.insert(0, str(_p))
+        break
+
 import aiohttp  # noqa: E402
 
 from db import Database  # noqa: E402

@@ -101,7 +101,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 
 
 @register(

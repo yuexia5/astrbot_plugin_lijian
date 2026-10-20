@@ -146,6 +146,12 @@
 
 ## 更新日志
 
+### v1.2.2
+
+- 修：`db.py` 与 `server.py` 改用 `from astrbot.api import logger`，不再自己 `logging.getLogger`，
+  符合插件上架规范（日志统一走 AstrBot 的日志体系，带插件名与级别前缀）。
+- 测试脚本在脱离 AstrBot 进程运行时自动把 AstrBot 源码根目录挂进 `sys.path`，不影响插件运行。
+
 ### v1.2.1
 
 - 修：备份日志里小于 1 KB 的文件显示成「0 KB」，看着像备份是空的。现在按字节显示。

@@ -8,6 +8,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# db/server 用的是 AstrBot 官方 logger，脱开 AstrBot 进程跑测试时把源码根目录挂进来
+for _p in Path(__file__).resolve().parents:
+    if (_p / "astrbot" / "api" / "__init__.py").is_file():
+        sys.path.insert(0, str(_p))
+        break
+
 import aiohttp
 
 from db import (

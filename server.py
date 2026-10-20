@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import logging
 import threading
 from typing import Any, Callable, Optional
 
+from astrbot.api import logger
+
 import aiohttp
 from aiohttp import web
-
-logger = logging.getLogger("astrbot_plugin_lijian")
 
 JSON = dict[str, Any]
 

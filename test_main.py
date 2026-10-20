@@ -2,7 +2,6 @@
 import asyncio
 import gzip
 import json
-import logging
 import socket
 import sys
 import tempfile
@@ -11,7 +10,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 # ---------- astrbot mock ----------
-logging.basicConfig(level=logging.WARNING)
+
+
+class _NullLogger:
+    """模拟 astrbot.api.logger：测试里不打印插件日志。"""
+
+    def _noop(self, *args, **kwargs):
+        pass
+
+    debug = info = warning = error = critical = exception = _noop
+
 
 astrbot = type(sys)("astrbot")
 sys.modules["astrbot"] = astrbot
@@ -26,7 +34,7 @@ class AstrBotConfig(dict):
 
 api = type(sys)("astrbot.api")
 api.AstrBotConfig = AstrBotConfig
-api.logger = logging.getLogger("mock-astrbot")
+api.logger = _NullLogger()
 astrbot.api = api
 
 event_mod = ModuleType("astrbot.api.event")
