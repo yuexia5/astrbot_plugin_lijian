@@ -6,3 +6,17 @@ version: v1.4.1
 author: baiwei
 repo: https://github.com/yuexia5/astrbot_plugin_lijian
 astrbot_version: ">=4.16.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - discord
+  - lark
+tags:
+  - 日记
+  - 长期记忆
+  - AI 记忆
+  - 每日总结
+  - 书架
+  - WebUI
+  - 拟人
