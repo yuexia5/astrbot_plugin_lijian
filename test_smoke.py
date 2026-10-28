@@ -283,7 +283,7 @@ async def test_bridge():
         db.close()
 
 
-def test_recall_and_streak():
+def test_anniversary_and_streak():
     """那年今天、连续天数、插件状态存取。"""
     db = Database(memory=True)
 
@@ -489,7 +489,7 @@ if __name__ == "__main__":
     print("== 新功能 ==")
     test_new_features()
     print("== 那年今天与连续天数 ==")
-    test_recall_and_streak()
+    test_anniversary_and_streak()
     print("== 桥接接口 ==")
     asyncio.run(test_bridge())
     print("== 安全加固 ==")

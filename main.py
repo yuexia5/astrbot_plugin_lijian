@@ -1,10 +1,9 @@
 """璃笺 AstrBot 插件：无头环境下的日记与便签书库。
 
 把桌面版璃笺（Tauri）的存储与写入接口移植进 AstrBot：
-- 指令：/日记状态 /写日记 /日记列表 /读日记 /删日记 /回卷（英文名作别名保留）
+- 指令：/日记状态 /写日记 /日记列表 /读日记 /删日记（英文名作别名保留）
 - LLM 工具：write_lijian_diary / list_lijian_notes / search_lijian_notes / read_lijian_note /
   update_lijian_note / delete_lijian_note / lijian_weekly
-- 回卷：开新上下文时自动把最近几天的日记翻给 AI 看，让它接着上次的记忆说话
 - 自己写：每天到点把当天攒的聊天交给模型，用当前人格的口吻写成一篇日记
 - 本地写入接口：监听 127.0.0.1:27176，与桌面版璃笺 API 兼容
 - WebUI 页面：书架 (pages/bookshelf)，含那年今天、连续天数
@@ -98,14 +97,6 @@ BACKUP_HOUR_DEFAULT = 3
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 27176
 
-# 回卷的固定口径。不做成配置项——会去调这几个数的人极少，
-# 却让每个装着它的人配置页都长一截。真需要再回来加。
-RECALL_LIMIT = 5
-RECALL_MAX_CHARS = 2400
-RECALL_GAP_HOURS = 6
-# 日记是私事，只在私聊翻，不留开关。
-RECALL_SCOPE = "private"
-
 # 自动写日记：每天到点把还没写进日记的聊天交给模型，写成一篇。
 #
 # 一天最多一次，这是它主动花钱的全部。但「省钱」不等于「一句话都不写」：
@@ -135,7 +126,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.5.0"
 
 
 @register(
@@ -151,9 +142,6 @@ class LijianPlugin(Star):
         self._db: Database | None = None
         self._bridge: BridgeServer | None = None
         self._backup_task: asyncio.Task | None = None
-        # 回卷记性：会话 -> 上次翻日记的时间（单调时钟秒）。
-        # 放内存里是有意的——插件重载即等于「换了个人醒过来」，那时正该重新翻书。
-        self._recalled: dict[str, float] = {}
         self._data_dir = self._resolve_data_dir()
         try:
             self._open_database()
@@ -221,169 +209,6 @@ class LijianPlugin(Star):
                 f"璃笺本地接口启动失败（端口 {host}:{port} 可能被占用），"
                 "写入仍可通过指令 / LLM 工具 / 书架页面进行。"
             )
-
-    # ---------- 回卷：让 AI 自己把日记翻回来 ----------
-
-    def _recall_enabled(self) -> bool:
-        try:
-            return bool(self.config.get("recall_enabled", True))
-        except Exception:  # noqa: BLE001
-            return True
-
-    def _recall_days(self) -> int:
-        try:
-            days = int(self.config.get("recall_days", 7))
-        except (TypeError, ValueError):
-            days = 7
-        return max(0, min(days, 365))
-
-    def _recall_candidates(self) -> list[dict[str, Any]]:
-        """挑出该翻给 AI 看的日记：只要日记，不要便签；不带归档的。"""
-        db = self._require_db()
-        notes = db.list_notes(include_archived=False)
-        cutoff = ""
-        days = self._recall_days()
-        if days > 0:
-            cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-        def _diaries(limit_from: str) -> list[dict[str, Any]]:
-            picked: list[dict[str, Any]] = []
-            for note in notes:
-                if note.get("kind") != "diary":
-                    continue
-                stamp = str(note.get("diary_date") or note.get("updated_at") or "")[:10]
-                if limit_from and stamp and stamp < limit_from:
-                    continue
-                picked.append(note)
-            # 日记日期新的在前；同一天按更新时间排。
-            picked.sort(
-                key=lambda n: (
-                    str(n.get("diary_date") or "")[:10],
-                    str(n.get("updated_at") or ""),
-                ),
-                reverse=True,
-            )
-            return picked[:RECALL_LIMIT]
-
-        picked = _diaries(cutoff)
-        if not picked and cutoff:
-            # 好些天没动笔是常事，不能因此让 AI 彻底接不上话。
-            # 退一步把最近写过的几篇翻给它，标题里的日期自己会说明有多旧。
-            picked = _diaries("")
-        return picked
-
-    @staticmethod
-    def _recall_stamp(note: dict[str, Any]) -> str:
-        raw = str(note.get("diary_date") or note.get("created_at") or "")[:10]
-        try:
-            day = datetime.strptime(raw, "%Y-%m-%d")
-        except ValueError:
-            return raw or "未标日期"
-        weekday = "一二三四五六日"[day.weekday()]
-        return f"{raw} 周{weekday}"
-
-    def _compose_recall(self, notes: list[dict[str, Any]]) -> str:
-        """把几篇日记缝成一段给 AI 的「翻书页」。
-
-        预算是硬的：从最新往回塞，塞不下就停，最后一篇超了按剩余额度截断。
-        最旧的先被牺牲，因为最近几天才是接得上话的那部分。
-        """
-        budget = RECALL_MAX_CHARS
-        chunks: list[str] = []
-        used = 0
-        for note in notes:
-            body = str(note.get("body_md") or "").strip()
-            if not body:
-                continue
-            title = str(note.get("title") or "").strip()
-            head = f"· {self._recall_stamp(note)}"
-            if title:
-                head += f"｜{title}"
-            piece = f"{head}\n{body}"
-            room = budget - used
-            if room <= 80:
-                break
-            if len(piece) > room:
-                piece = piece[: max(0, room - 12)].rstrip() + "\n…（后略）"
-            chunks.append(piece)
-            used += len(piece) + 2
-            if used >= budget:
-                break
-        if not chunks:
-            return ""
-        return (
-            "【璃笺 · 回卷】\n"
-            "下面这段是先前的你写下的日记。它就是你自己的记忆，直接当作经历过的事来用：\n"
-            "不要向对方复述日记内容，不要说「根据日记」「记录里写着」这类话，"
-            "也不要在句尾补充说明你读过它。自然地记得就够了。\n\n"
-            + "\n\n".join(chunks)
-            + "\n【回卷结束】"
-        )
-
-    def _recall_due(self, key: str) -> bool:
-        last = self._recalled.get(key)
-        if last is None:
-            return True
-        gap = float(RECALL_GAP_HOURS) * 3600.0
-        if gap <= 0:
-            return False
-        return (time.monotonic() - last) >= gap
-
-    @filter.on_llm_request()
-    async def recall_before_llm(
-        self, event: AstrMessageEvent, req: ProviderRequest
-    ):
-        """每次请求前判断：这个人（这个会话）是不是刚醒过来，该翻一遍日记了。
-
-        同一个会话翻过一次就记住，不重复占上下文；隔了 recall_gap_hours
-        没说话才会再翻，免得一天聊十轮塞十遍。
-        """
-        if not self._recall_enabled() or self._db is None:
-            return
-        if RECALL_SCOPE == "private" and not event.is_private_chat():
-            return
-        try:
-            key = str(req.session_id or event.get_session_id() or "")
-        except Exception:  # noqa: BLE001
-            key = ""
-        if not key:
-            return
-        if not self._recall_due(key):
-            return
-        try:
-            block = await asyncio.to_thread(self._compose_recall, self._recall_candidates())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"璃笺回卷失败: {exc}")
-            return
-        if not block:
-            return
-        base = req.system_prompt or ""
-        req.system_prompt = f"{base}\n\n{block}" if base else block
-        self._recalled[key] = time.monotonic()
-        logger.info(f"璃笺回卷：已翻给 {key} 看，{len(block)} 字")
-
-    @filter.command("回卷", alias={"lijian_recall"})
-    async def lijian_recall(self, event: AstrMessageEvent):
-        """看看下次开新上下文时，璃笺会翻哪几篇日记给 AI。"""
-        if self._db is None:
-            yield event.plain_result("璃笺数据库不可用。")
-            return
-        try:
-            notes = self._recall_candidates()
-        except Exception as exc:  # noqa: BLE001
-            yield event.plain_result(f"回卷预览失败：{exc}")
-            return
-        if not notes:
-            yield event.plain_result(
-                f"最近 {self._recall_days() or '全部'} 天里还没有日记，回卷时没东西可翻。"
-            )
-            return
-        lines = [f"下次回卷会翻这 {len(notes)} 篇："]
-        for note in notes:
-            title = str(note.get("title") or "").strip() or "（无标题）"
-            lines.append(f"· {self._recall_stamp(note)}｜{title}")
-        lines.append(f"字数上限 {RECALL_MAX_CHARS}，超了从最旧的开始截。")
-        yield event.plain_result("\n".join(lines))
 
     # ---------- 自动写日记 ----------
 
@@ -902,12 +727,6 @@ class LijianPlugin(Star):
                     lines.append(f"自己写日记：今晚 {hour}:00，今天没聊，会写一篇安静的")
                 else:
                     lines.append(f"自己写日记：今晚 {hour}:00，今天没聊，先不写")
-        # 回卷
-        if self._recall_enabled():
-            span = self._recall_days()
-            lines.append(f"记得你：最近 {span} 天" if span else "记得你：写过的事都翻")
-        else:
-            lines.append("记得你：关")
         if self._backup_enabled():
             lines.append(f"备份：每天一份，留最近 {BACKUP_KEEP_DEFAULT} 份")
         else:

@@ -11,18 +11,6 @@
     "default": 23,
     "hint": "默认晚上 11 点，0-23。改完重载插件生效。"
   },
-  "recall_enabled": {
-    "description": "让她记得",
-    "type": "bool",
-    "default": true,
-    "hint": "重载插件或隔了很久再聊时，AI 会先翻一遍最近写的日记，接上上次的话。关掉就是每次都要你重新交代。"
-  },
-  "recall_days": {
-    "description": "往回记得多少天",
-    "type": "int",
-    "default": 7,
-    "hint": "默认 7 天。填 0 表示不限日期，只取最近几篇。"
-  },
   "default_mode": {
     "description": "AI 写日记时怎么落笔",
     "type": "string",

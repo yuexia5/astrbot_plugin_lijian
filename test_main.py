@@ -316,12 +316,10 @@ with tempfile.TemporaryDirectory() as tmp:
     plugin_main.BRIDGE_PORT = free_port()
     plugin_main.BACKUP_KEEP_DEFAULT = 3
     plugin_main.BACKUP_HOUR_DEFAULT = 0
-    # 只剩五个真配置项，其余全写死
+    # 配置项都有默认值，这里只动跟测试有关的两个
     config = AstrBotConfig(
         {
             "default_mode": "append_today",
-            "recall_enabled": True,
-            "recall_days": 7,
             "backup_enabled": True,
         }
     )
@@ -339,12 +337,12 @@ with tempfile.TemporaryDirectory() as tmp:
         command_aliases |= getattr(member, "__alias__", set())
     check(
         "commands are chinese",
-        {"日记状态", "写日记", "日记列表", "读日记", "删日记", "回卷"} <= command_names,
+        {"日记状态", "写日记", "日记列表", "读日记", "删日记"} <= command_names,
         command_names,
     )
     check(
         "commands keep english alias",
-        {"lijian_status", "lijian_write", "lijian_recall"} <= command_aliases,
+        {"lijian_status", "lijian_write", "lijian_delete"} <= command_aliases,
         command_aliases,
     )
     check(
@@ -619,107 +617,6 @@ with tempfile.TemporaryDirectory() as tmp:
 
     asyncio.run(run_tools())
 
-    async def run_recall():
-        # 造一篇日期明确的日记 + 一条便签，验证回卷只翻日记
-        plugin._db.create_note(
-            {
-                "title": "牡丹园",
-                "body_md": "今天去了曹州牡丹园，花开得很好。",
-                "kind": "diary",
-                "diary_date": plugin_main.local_today(),
-                "tags": ["牡丹"],
-                "source": "local",
-            }
-        )
-        plugin._db.create_note(
-            {
-                "title": "一条便签",
-                "body_md": "记得买牛奶。",
-                "kind": "note",
-                "tags": [],
-                "source": "local",
-            }
-        )
-
-        plugin._recalled.clear()
-        event = AstrMessageEvent(private=True, session="sess-private")
-        req = ProviderRequest(session_id="sess-private", system_prompt="你是女仆")
-        await plugin.recall_before_llm(event, req)
-        check("recall injects", "璃笺 · 回卷" in req.system_prompt)
-        check("recall keeps system prompt", "你是女仆" in req.system_prompt)
-        check("recall includes diary", "牡丹园" in req.system_prompt)
-        check("recall excludes note", "买牛奶" not in req.system_prompt)
-
-        # 同一个会话翻过一次就不再塞
-        again = ProviderRequest(session_id="sess-private", system_prompt="你是女仆")
-        await plugin.recall_before_llm(event, again)
-        check("recall not repeated", again.system_prompt == "你是女仆")
-
-        # 群聊默认不翻（日记不该说给一群人听）
-        plugin._recalled.clear()
-        group_req = ProviderRequest(session_id="group-1", system_prompt="")
-        await plugin.recall_before_llm(
-            AstrMessageEvent(private=False, session="group-1"), group_req
-        )
-        check("recall skipped in group", "回卷" not in group_req.system_prompt)
-
-        # 字数上限要真的生效
-        plugin.config["recall_max_chars"] = 300
-        plugin._recalled.clear()
-        small = ProviderRequest(session_id="sess-small")
-        await plugin.recall_before_llm(
-            AstrMessageEvent(private=True, session="sess-small"), small
-        )
-        check("recall respects char cap", len(small.system_prompt) < 900,
-              len(small.system_prompt))
-        plugin.config["recall_max_chars"] = 2400
-
-        # 开关关掉就一句都不加
-        plugin.config["recall_enabled"] = False
-        plugin._recalled.clear()
-        off = ProviderRequest(session_id="sess-off")
-        await plugin.recall_before_llm(
-            AstrMessageEvent(private=True, session="sess-off"), off
-        )
-        check("recall respects switch", off.system_prompt == "")
-        plugin.config["recall_enabled"] = True
-
-        # 预览指令
-        lines = [line async for line in plugin.lijian_recall(AstrMessageEvent())]
-        check("command recall preview", "下次回卷会翻" in lines[0])
-
-        # 检索工具：关键词命中 + 片段
-        result = json.loads(await plugin.search_lijian_notes(None, "牡丹"))
-        check("tool search hits", result["ok"] and result["count"] >= 1)
-        check("tool search snippet", "曹州" in result["notes"][0]["snippet"])
-        check("tool search returns id", bool(result["notes"][0]["id"]))
-
-        # 日期范围能把东西筛掉
-        result = json.loads(
-            await plugin.search_lijian_notes(None, "", since="2000-01-01", until="2000-01-02")
-        )
-        check("tool search date range", result["ok"] and result["count"] == 0)
-
-        # 窗口内一篇都没有时，退一步拿最近写过的——不能因为好久没动笔就彻底失忆
-        keep = plugin._db
-        plugin._db = plugin_main.Database(memory=True)
-        try:
-            plugin._db.create_note(
-                {
-                    "title": "很久以前",
-                    "body_md": "老掉牙的一篇",
-                    "kind": "diary",
-                    "diary_date": "2020-01-01",
-                }
-            )
-            fallback = plugin._recall_candidates()
-            check("recall falls back outside window",
-                  len(fallback) == 1 and fallback[0]["title"] == "很久以前")
-        finally:
-            plugin._db.close()
-            plugin._db = keep
-
-    asyncio.run(run_recall())
 
     async def run_auto_write():
         # 定时任务：注册一次，重载不叠加
