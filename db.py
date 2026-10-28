@@ -605,27 +605,33 @@ class Database:
             return self.get_note(note_id)
 
     def archive_note(self, note_id: str, archived: bool = True) -> dict[str, Any]:
+        """移入或移出归档。note_id 可以是完整 id，也可以是唯一前缀。"""
         with self._lock:
+            # 先解析成完整 id。指令里只显示 8 位短号，直接拿短号去 UPDATE
+            # 会一行都改不到，却还能回一句「已归档」——静默失败最难查。
+            note = self.get_note(note_id)
             self.conn.execute(
                 "UPDATE notes SET archived = ?, updated_at = ? WHERE id = ?",
-                (1 if archived else 0, now(), note_id),
+                (1 if archived else 0, now(), note["id"]),
             )
             self._persist()
-            return self.get_note(note_id)
+            return self.get_note(note["id"])
 
     def delete_note(self, note_id: str) -> None:
         with self._lock:
-            self.conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+            note = self.get_note(note_id)
+            self.conn.execute("DELETE FROM notes WHERE id = ?", (note["id"],))
             self._persist()
 
     def pin_note(self, note_id: str, pinned: bool = True) -> dict[str, Any]:
         with self._lock:
+            note = self.get_note(note_id)
             self.conn.execute(
                 "UPDATE notes SET pinned = ?, updated_at = ? WHERE id = ?",
-                (1 if pinned else 0, now(), note_id),
+                (1 if pinned else 0, now(), note["id"]),
             )
             self._persist()
-            return self.get_note(note_id)
+            return self.get_note(note["id"])
 
     def save_tile_rect(self, note_id: str, rect: dict[str, Any]) -> dict[str, Any]:
         with self._lock:

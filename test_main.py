@@ -806,6 +806,11 @@ with tempfile.TemporaryDirectory() as tmp:
             plugin._strip_code_fence("```markdown\n正文\n```") == "正文",
         )
 
+        # 读日记/删日记不带 id 时给的小清单，不能抛异常
+        hint = plugin._recent_notes_hint()
+        check("recent hint is text", isinstance(hint, str) and hint != "")
+        check("recent hint short id", "—" in hint or "还没有条目" in hint)
+
         # 标签行拆分：三种写法都要认，且正文里不能留下那一行
         body, tags = plugin._split_ai_tags("**标题**\n\n正文一段。\n\n标签：糖、撒娇、晚安")
         check("split tags plain", (body, tags) == ("**标题**\n\n正文一段。", ["糖", "撒娇", "晚安"]))

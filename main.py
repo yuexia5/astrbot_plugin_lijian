@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.3"
+PLUGIN_VERSION = "1.5.4"
 
 
 @register(
@@ -936,11 +936,32 @@ class LijianPlugin(Star):
             lines.append(f"{index}. [{kind} {date_str}] {note['title']} (id: {note['id'][:8]}…)")
         yield event.plain_result(f"璃笺书架（共 {len(notes)} 条）：\n" + "\n".join(lines))
 
+    def _recent_notes_hint(self, limit: int = 5) -> str:
+        """不带 id 时给人看的一份小清单，省得去书架上翻。"""
+        try:
+            notes = self._db.list_notes(False)[:limit]
+        except Exception as exc:  # noqa: BLE001
+            return f"书架读取失败：{exc}"
+        if not notes:
+            return "书架上还没有条目。"
+        lines = []
+        for index, note in enumerate(notes, start=1):
+            date_str = note.get("diary_date") or note["created_at"][:10]
+            lines.append(f"{index}. [{date_str}] {note['title']} — {note['id'][:8]}")
+        return "\n".join(lines)
+
     @filter.command("读日记", alias={"lijian_read"})
-    async def lijian_read(self, event: AstrMessageEvent, note_id: str):
-        """读取某一篇日记或便签的完整内容。"""
+    async def lijian_read(self, event: AstrMessageEvent, note_id: str = ""):
+        """读取某一篇日记或便签的完整内容。不带 id 时列出最近几篇。"""
         if self._db is None:
             yield event.plain_result("璃笺数据库不可用。")
+            return
+        note_id = (note_id or "").strip()
+        if not note_id:
+            yield event.plain_result(
+                "想读哪一篇？把后面的短号接在指令后面，比如 /读日记 f2343fe3\n\n"
+                + self._recent_notes_hint()
+            )
             return
         try:
             note = self._db.get_note(note_id)
@@ -958,17 +979,28 @@ class LijianPlugin(Star):
         )
 
     @filter.command("删日记", alias={"lijian_delete"})
-    async def lijian_delete(self, event: AstrMessageEvent, note_id: str):
-        """把某一篇日记或便签移入归档。"""
+    async def lijian_delete(self, event: AstrMessageEvent, note_id: str = ""):
+        """把某一篇日记或便签移入归档。不带 id 时列出最近几篇。"""
         if self._db is None:
             yield event.plain_result("璃笺数据库不可用。")
+            return
+        note_id = (note_id or "").strip()
+        if not note_id:
+            yield event.plain_result(
+                "要收哪一篇？把后面的短号接在指令后面，比如 /删日记 f2343fe3\n"
+                "收起来是移入归档，书架上点归档还能翻到，不是真删。\n\n"
+                + self._recent_notes_hint()
+            )
             return
         try:
             note = self._db.archive_note(note_id, True)
         except Exception as exc:
             yield event.plain_result(f"璃笺归档失败：{exc}")
             return
-        yield event.plain_result(f"已移入归档：《{note['title']}》")
+        yield event.plain_result(
+            f"已收进归档：《{note['title']}》\n"
+            "书架上点归档能翻到，想彻底删掉在书架页里操作。"
+        )
 
     # ---------- LLM 工具 ----------
 

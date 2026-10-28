@@ -83,6 +83,13 @@ def test_database():
         listed_all = db.list_notes(True)
         check("archived visible when asked", any(x["id"] == note["id"] for x in listed_all))
 
+        # 指令里只显示 8 位短号，必须能按前缀归档，否则会静默不改却回「已归档」
+        restored = db.archive_note(note["id"], False)
+        check("unarchive by full id", restored["archived"] is False)
+        by_prefix = db.archive_note(note["id"][:8], True)
+        check("archive by prefix", by_prefix["archived"] is True)
+        check("archive by prefix id intact", by_prefix["id"] == note["id"])
+
         stats = db.stats()
         check("stats counts", stats["notes"] == 1 and stats["archived"] == 1)
 
