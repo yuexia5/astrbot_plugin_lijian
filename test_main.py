@@ -723,6 +723,29 @@ with tempfile.TemporaryDirectory() as tmp:
         await plugin._auto_write_tick()
         check("auto write once per day", provider.calls == [])
 
+        # 但主人自己开口要，就不该被「今天已经写过了」挡下来
+        provider = FakeProvider("**手动要的那篇**\n\n他让我现在写一篇。\n\n标签：手动、戳一下")
+        ctx.provider = provider
+        result = await plugin._compose_diary(manual=True)
+        check(
+            "manual write ignores once-per-day",
+            len(provider.calls) == 1,
+            len(provider.calls),
+        )
+        check("manual write ok", result.get("ok") is True, str(result)[:80])
+        check("manual write has chars", (result.get("chars") or 0) > 0)
+        check("manual write has note", bool(result.get("note")))
+
+        # 命令在不带内容时不能报「必要参数缺失」，得能自己写
+        import inspect as _inspect
+
+        params = _inspect.signature(plugin.lijian_write).parameters
+        check(
+            "write command content optional",
+            params["content"].default == "",
+            repr(params["content"].default),
+        )
+
         # 一句话也值得写：门槛不该卡在条数上
         plugin._db.material_clear()
         plugin._db.state_set("auto_write", {})

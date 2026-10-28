@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.2"
+PLUGIN_VERSION = "1.5.3"
 
 
 @register(
@@ -442,12 +442,23 @@ class LijianPlugin(Star):
 
     async def _auto_write_tick(self) -> None:
         """到点了：把还没写进日记的聊天交给模型，写成一篇。"""
+        await self._compose_diary(manual=False)
+
+    async def _compose_diary(self, manual: bool = False) -> dict:
+        """写一篇日记：取素材、调模型、落库、推进游标。
+
+        manual=True 是主人在聊天里主动要的（发「写日记」不带内容）。
+        这条路不该被「今天已经写过了」「今天没怎么聊」挡下来——他开口要了，
+        就该给。挡住的只有定时任务那条路。
+
+        返回 {"ok": bool, "message": str, "note": dict|None, "chars": int}。
+        """
         if self._db is None:
-            return
+            return {"ok": False, "message": "璃笺数据库不可用。"}
         # 一天只写一篇。定时任务万一被重载多排了一次，也不能写两篇、扣两次额度。
-        if self._auto_write_done_today():
+        if not manual and self._auto_write_done_today():
             logger.info("璃笺自动写日记：今天已经写过了，跳过")
-            return
+            return {"ok": False, "message": "今天已经写过了"}
         try:
             cursor = await asyncio.to_thread(self._db.material_cursor)
             digest, count, last_id = await asyncio.to_thread(
@@ -455,7 +466,7 @@ class LijianPlugin(Star):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺读取聊天素材失败: {exc}")
-            return
+            return {"ok": False, "message": f"读不到聊天素材：{exc}"}
 
         # 有话说就写，一句也算。没话也不等于没得写——「他今天没来」本身就是日记。
         # 但天天写这个就成了念经，所以冷场要隔几天才补一篇。
@@ -465,17 +476,18 @@ class LijianPlugin(Star):
         idle_days = 0
         if not has_material:
             idle_days = await asyncio.to_thread(self._days_since_last_diary)
-            if idle_days < AUTO_IDLE_GAP_DAYS:
-                logger.info(
-                    f"璃笺自动写日记：今天没怎么聊（{count} 条 / {len(digest)} 字），"
-                    f"上一篇才 {idle_days} 天前，这次不写（不调用模型）"
-                )
-                return
-            if idle_days < 0:
-                # 刚装好、一篇都还没写过。这时候写「好久没消息」是凭空造的，
-                # 等真有人聊过、开过头，冷场才有意义。
-                logger.info("璃笺自动写日记：一篇日记都还没有，今晚不凭空开篇")
-                return
+            if not manual:
+                if idle_days < AUTO_IDLE_GAP_DAYS:
+                    logger.info(
+                        f"璃笺自动写日记：今天没怎么聊（{count} 条 / {len(digest)} 字），"
+                        f"上一篇才 {idle_days} 天前，这次不写（不调用模型）"
+                    )
+                    return {"ok": False, "message": "今天没怎么聊，先不写"}
+                if idle_days < 0:
+                    # 刚装好、一篇都还没写过。这时候写「好久没消息」是凭空造的，
+                    # 等真有人聊过、开过头，冷场才有意义。
+                    logger.info("璃笺自动写日记：一篇日记都还没有，今晚不凭空开篇")
+                    return {"ok": False, "message": "还没有旧日记，先不凭空开篇"}
 
         # 用哪个会话的 umo 取人格：素材里最后说话的那个；没素材就用默认人格。
         session = ""
@@ -511,8 +523,11 @@ class LijianPlugin(Star):
                 f"{tag_hint}"
             )
         else:
+            # 手动要一篇但今天什么都没聊时，idle_days 可能还是 -1（一篇旧日记都没有），
+            # 照抄进提示词会变成「已经 -1 天没有收到消息」，模型只会照着这句写。
+            quiet_days = max(idle_days, 1)
             prompt = (
-                f"今天是 {today}。到今天为止，已经 {idle_days} 天没有收到对方的任何消息了。\n\n"
+                f"今天是 {today}。到今天为止，已经 {quiet_days} 天没有收到对方的任何消息了。\n\n"
                 "写一篇今天的日记。\n"
                 "- 就写这件事：这些天很安静，没有人在\n"
                 "- 可以写怎么打发时间、有没有反复看手机、有没有假装不在意\n"
@@ -524,7 +539,7 @@ class LijianPlugin(Star):
         provider = self._diary_provider(session)
         if provider is None:
             logger.warning("璃笺自动写日记：没有可用的模型提供商，跳过")
-            return
+            return {"ok": False, "message": "没有可用的模型提供商"}
         provider_name = self._provider_name(provider)
         try:
             response = await provider.text_chat(
@@ -535,12 +550,12 @@ class LijianPlugin(Star):
                 f"璃笺自动写日记调用模型失败（{provider_name}）: {exc}"
                 "；素材游标没动，在璃笺配置里换个模型重跑还能补上"
             )
-            return
+            return {"ok": False, "message": f"模型调用失败（{provider_name}）：{exc}"}
         body = self._strip_code_fence(getattr(response, "completion_text", ""))
         body, ai_tags = self._split_ai_tags(body)
         if not body:
             logger.warning("璃笺自动写日记：模型返回了空正文，游标不动，下次再试")
-            return
+            return {"ok": False, "message": "模型返回了空正文，素材没动，可以再试一次"}
         if not ai_tags:
             ai_tags = ["日记"]
         try:
@@ -556,7 +571,7 @@ class LijianPlugin(Star):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺自动写日记写入失败: {exc}")
-            return
+            return {"ok": False, "message": f"写入书架失败：{exc}"}
         # 写成功了才推进游标：这一次失败不该把这些话算成已经写过。
         # 推进而不是清空，所以今天 23 点之后聊的那几句会接着进明天那一篇。
         try:
@@ -579,6 +594,7 @@ class LijianPlugin(Star):
             f"璃笺自动写日记完成：{note['title']}"
             f"（用了 {count} 条素材、{len(digest)} 字，写成 {len(body)} 字）"
         )
+        return {"ok": True, "message": "写好了", "note": note, "chars": len(body)}
 
     # ---------- 自动备份 ----------
 
@@ -846,17 +862,45 @@ class LijianPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.command("写日记", alias={"lijian_write"})
-    async def lijian_write(self, event: AstrMessageEvent, content: str):
-        """手动写入一篇日记（追加到今日）。"""
+    async def lijian_write(self, event: AstrMessageEvent, content: str = ""):
+        """让璃笺现在写一篇今天的日记。
+
+        不带内容：自己取聊天素材，让模型按人格写一篇（跟到点自动写是同一条路）。
+        带上文字：把你给的这段原样存成一篇。
+        """
+        text = (content or "").strip()
+        if text:
+            # 指令参数是按空格切开的，长一点的话只会拿到第一个词。
+            # 既然都写了内容，多半是整段话，改从原始消息里把指令后面全截下来。
+            raw = str(event.get_message_str() or "").strip()
+            for cmd_name in ("写日记", "lijian_write"):
+                pos = raw.find(cmd_name)
+                if pos >= 0:
+                    tail = raw[pos + len(cmd_name) :].strip()
+                    if tail:
+                        text = tail
+                        break
+        if not text:
+            result = await self._compose_diary(manual=True)
+            if not result.get("ok"):
+                yield event.plain_result(
+                    f"这篇没写成：{result.get('message') or '未知原因'}"
+                )
+                return
+            note = result.get("note") or {}
+            yield event.plain_result(
+                f"写好了：《{note.get('title') or '日记'}》，{result.get('chars') or 0} 字"
+            )
+            return
         if self._db is None:
             yield event.plain_result("璃笺数据库不可用。")
             return
         try:
             note = self._db.write_diary_from_ai(
                 {
-                    "content_md": content,
-                    "title": "AstrBot 手动写入",
-                    "tags": ["AstrBot"],
+                    "content_md": text,
+                    "title": None,
+                    "tags": ["日记"],
                     "mode": self.config.get("default_mode", "append_today"),
                 }
             )
