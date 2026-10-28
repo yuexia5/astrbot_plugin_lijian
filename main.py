@@ -5,6 +5,7 @@
 - LLM 工具：write_lijian_diary / list_lijian_notes / search_lijian_notes / read_lijian_note /
   update_lijian_note / delete_lijian_note / lijian_weekly
 - 回卷：开新上下文时自动把最近几天的日记翻给 AI 看，让它接着上次的记忆说话
+- 自己写：每天到点把当天攒的聊天交给模型，用当前人格的口吻写成一篇日记
 - 本地写入接口：监听 127.0.0.1:27176，与桌面版璃笺 API 兼容
 - WebUI 页面：书架 (pages/bookshelf)，含那年今天、连续天数
 - 自动备份：每天把整库压成 .json.gz，放在数据目录的 backups/ 下，只留最近 N 份
@@ -92,6 +93,35 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 BACKUP_DIR_NAME = "backups"
 BACKUP_KEEP_DEFAULT = 30
 BACKUP_HOUR_DEFAULT = 3
+
+# 写入接口固定监听本机回环。不提供开关：开了也没人会去关，暴露到局域网反而危险。
+BRIDGE_HOST = "127.0.0.1"
+BRIDGE_PORT = 27176
+
+# 回卷的固定口径。不做成配置项——会去调这几个数的人极少，
+# 却让每个装着它的人配置页都长一截。真需要再回来加。
+RECALL_LIMIT = 5
+RECALL_MAX_CHARS = 2400
+RECALL_GAP_HOURS = 6
+# 日记是私事，只在私聊翻，不留开关。
+RECALL_SCOPE = "private"
+
+# 自动写日记：每天到点把攒下来的聊天交给模型，写成一篇。
+#
+# 这是一天里唯一会主动花钱的动作，所以门槛卡得死一点：
+# 一天最多一次、素材条数和字数都要够、素材总量有上限、输出长度也限住。
+# 宁可这天不写，也不要为了凑一篇把额度烧掉。
+AUTO_WRITE_JOB_NAME = "璃笺：把今天写成日记"
+AUTO_MIN_MATERIAL = 6          # 少于这么多条不写，聊两句没什么可记的
+AUTO_MIN_MATERIAL_CHARS = 200  # 少于这么多字也不写，「嗯」「好」凑数不算
+AUTO_MATERIAL_MAX_CHARS = 8000 # 喂给模型的素材上限，约 4k token
+
+# 让模型写日记时用的口径。重点是别让它编：没聊过的事一律不许出现。
+AUTO_WRITE_SYSTEM = (
+    "接下来你要用第一人称写一篇日记，就是你自己在记今天的事。"
+    "日记是写给以后那个会忘记今天的自己看的，所以只写真的发生过的事，"
+    "不编造、不美化、不写成汇报。"
+)
 # 备份文件是 gzip 过的 JSON，恢复时按魔数判断，不靠扩展名。
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 GZIP_MAGIC = b"\x1f\x8b"
@@ -103,7 +133,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 
 
 @register(
@@ -147,13 +177,13 @@ class LijianPlugin(Star):
         return base / PLUGIN_NAME
 
     def _open_database(self) -> None:
-        configured = str(self.config.get("db_path", "") or "").strip()
-        if configured:
-            db_path = configured
-        else:
-            db_path = self._data_dir / "lijian.sqlite3"
+        # 库固定放在插件数据目录，不给配置项——挪库是极少数人的需求，
+        # 却让每个人都要判断「这个空框要不要填」。
+        db_path = self._data_dir / "lijian.sqlite3"
         self._db = Database(db_path)
-        self._db.ensure_ai_token(str(self.config.get("token", "") or ""))
+        # 令牌空着进来：库里已有就沿用（外部脚本的令牌不会因为升级失效），
+        # 没有就生成一个新的。书架页面能看到。
+        self._db.ensure_ai_token("")
         # 只有库彻底为空时才放第一篇。用 include_archived=True 判断，
         # 否则用户把笔记全部归档后重载插件，又会冒出一篇「第一笺」。
         if not self._db.list_notes(True):
@@ -181,30 +211,13 @@ class LijianPlugin(Star):
             logger.warning(f"创建第一笺失败: {exc}")
 
     def _start_bridge(self) -> None:
-        try:
-            enabled = bool(self.config.get("bridge_enabled", True))
-        except Exception:  # noqa: BLE001
-            enabled = True
-        if not enabled:
-            logger.info("璃笺本地写入接口未启用（bridge_enabled=false）")
-            return
-        host = str(self.config.get("bridge_host", "127.0.0.1"))
-        try:
-            port = int(self.config.get("bridge_port", 27176))
-        except (TypeError, ValueError):
-            port = 27176
-        if host not in ("127.0.0.1", "::1", "localhost"):
-            # 绑到 0.0.0.0 之后，同一网段的人拿着令牌就能读写日记。
-            # 这是用户自己选的，但得让他清楚现在是什么状态。
-            logger.warning(
-                f"璃笺本地接口监听在 {host}:{port}，"
-                "已超出本机范围，同网段可访问。若不需要请把 bridge_host 改回 127.0.0.1。"
-            )
+        # 地址和端口写死在本机回环上：日记数据不该有「暴露到局域网」这个选项。
+        host, port = BRIDGE_HOST, BRIDGE_PORT
         self._bridge = BridgeServer(self._db, host=host, port=port)
         if not self._bridge.start():
             logger.warning(
                 f"璃笺本地接口启动失败（端口 {host}:{port} 可能被占用），"
-                "写入仅能通过指令 / LLM 工具 / 书架页面进行。"
+                "写入仍可通过指令 / LLM 工具 / 书架页面进行。"
             )
 
     # ---------- 回卷：让 AI 自己把日记翻回来 ----------
@@ -221,32 +234,6 @@ class LijianPlugin(Star):
         except (TypeError, ValueError):
             days = 7
         return max(0, min(days, 365))
-
-    def _recall_limit(self) -> int:
-        try:
-            limit = int(self.config.get("recall_limit", 5))
-        except (TypeError, ValueError):
-            limit = 5
-        return max(1, min(limit, 20))
-
-    def _recall_max_chars(self) -> int:
-        try:
-            chars = int(self.config.get("recall_max_chars", 2400))
-        except (TypeError, ValueError):
-            chars = 2400
-        return max(300, min(chars, 20000))
-
-    def _recall_scope(self) -> str:
-        scope = str(self.config.get("recall_scope", "private") or "private")
-        return scope if scope in ("private", "all") else "private"
-
-    def _recall_gap_seconds(self) -> float:
-        try:
-            hours = int(self.config.get("recall_gap_hours", 6))
-        except (TypeError, ValueError):
-            hours = 6
-        hours = max(0, min(hours, 720))
-        return float(hours) * 3600.0
 
     def _recall_candidates(self) -> list[dict[str, Any]]:
         """挑出该翻给 AI 看的日记：只要日记，不要便签；不带归档的。"""
@@ -274,7 +261,7 @@ class LijianPlugin(Star):
                 ),
                 reverse=True,
             )
-            return picked[: self._recall_limit()]
+            return picked[:RECALL_LIMIT]
 
         picked = _diaries(cutoff)
         if not picked and cutoff:
@@ -299,7 +286,7 @@ class LijianPlugin(Star):
         预算是硬的：从最新往回塞，塞不下就停，最后一篇超了按剩余额度截断。
         最旧的先被牺牲，因为最近几天才是接得上话的那部分。
         """
-        budget = self._recall_max_chars()
+        budget = RECALL_MAX_CHARS
         chunks: list[str] = []
         used = 0
         for note in notes:
@@ -335,7 +322,7 @@ class LijianPlugin(Star):
         last = self._recalled.get(key)
         if last is None:
             return True
-        gap = self._recall_gap_seconds()
+        gap = float(RECALL_GAP_HOURS) * 3600.0
         if gap <= 0:
             return False
         return (time.monotonic() - last) >= gap
@@ -351,7 +338,7 @@ class LijianPlugin(Star):
         """
         if not self._recall_enabled() or self._db is None:
             return
-        if self._recall_scope() == "private" and not event.is_private_chat():
+        if RECALL_SCOPE == "private" and not event.is_private_chat():
             return
         try:
             key = str(req.session_id or event.get_session_id() or "")
@@ -393,8 +380,228 @@ class LijianPlugin(Star):
         for note in notes:
             title = str(note.get("title") or "").strip() or "（无标题）"
             lines.append(f"· {self._recall_stamp(note)}｜{title}")
-        lines.append(f"字数上限 {self._recall_max_chars()}，超了从最旧的开始截。")
+        lines.append(f"字数上限 {RECALL_MAX_CHARS}，超了从最旧的开始截。")
         yield event.plain_result("\n".join(lines))
+
+    # ---------- 自动写日记 ----------
+
+    def _auto_write_enabled(self) -> bool:
+        try:
+            return bool(self.config.get("auto_write_enabled", True))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _auto_write_hour(self) -> int:
+        try:
+            hour = int(self.config.get("auto_write_hour", 23))
+        except (TypeError, ValueError):
+            hour = 23
+        return max(0, min(hour, 23))
+
+    async def initialize(self) -> None:
+        """AstrBot 加载完插件后调这里，定时任务要在事件循环里注册。"""
+        await self._register_auto_write_job()
+
+    async def _register_auto_write_job(self) -> None:
+        manager = getattr(self.context, "cron_manager", None)
+        if manager is None:
+            logger.info("璃笺自动写日记：当前 AstrBot 没有定时任务管理，跳过排程")
+            return
+        # 热重载会重新加载插件，上一次注册的任务得先摘掉，否则攒一串。
+        try:
+            for job in await manager.list_jobs("basic"):
+                if str(getattr(job, "name", "")) == AUTO_WRITE_JOB_NAME:
+                    await manager.delete_job(job.job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺清理旧定时任务失败: {exc}")
+        if not self._auto_write_enabled():
+            logger.info("璃笺自动写日记未启用（auto_write_enabled=false）")
+            return
+        hour = self._auto_write_hour()
+        try:
+            await manager.add_basic_job(
+                name=AUTO_WRITE_JOB_NAME,
+                cron_expression=f"0 {hour} * * *",
+                handler=self._auto_write_tick,
+                description="璃笺：把今天聊过的写成一篇日记",
+                persistent=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺自动写日记排程失败: {exc}")
+            return
+        logger.info(f"璃笺自动写日记已排程：每天 {hour}:00")
+
+    @filter.on_llm_request()
+    async def collect_material_on_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """聊天时顺手把对方的话记进素材池。"""
+        if not self._auto_write_enabled() or self._db is None:
+            return
+        if not event.is_private_chat():
+            return
+        text = str(getattr(event, "message_str", "") or "").strip()
+        if not text:
+            return
+        try:
+            await asyncio.to_thread(
+                self._db.material_append, event.unified_msg_origin, "user", text
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺记录聊天素材失败: {exc}")
+
+    @filter.on_llm_response()
+    async def collect_material_on_response(
+        self, event: AstrMessageEvent, response: Any
+    ):
+        """把自己说的话也记进去，写日记时才知道当时怎么应的。"""
+        if not self._auto_write_enabled() or self._db is None:
+            return
+        if not event.is_private_chat():
+            return
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            return
+        try:
+            await asyncio.to_thread(
+                self._db.material_append, event.unified_msg_origin, "assistant", text
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺记录聊天素材失败: {exc}")
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """模型爱把正文裹在 ```markdown 里，日记本上不该有这层壳。"""
+        body = str(text or "").strip()
+        if not body.startswith("```"):
+            return body
+        lines = body.splitlines()
+        if len(lines) >= 2 and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    def _auto_write_done_today(self) -> bool:
+        try:
+            last = self._db.state_get("auto_write", {}) or {}
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(last, dict) and str(last.get("date", "")) == local_today()
+
+    async def _persona_prompt(self, umo: str = "") -> str:
+        """取这台 AstrBot 里给这个会话设的人格卡。
+
+        日记得用她自己的口吻写，不能是千篇一律的「AI 助手」腔。
+        取不到就空着，退回通用口径，不能因为没人格就不写。
+        """
+        manager = getattr(self.context, "persona_manager", None)
+        if manager is None:
+            return ""
+        try:
+            persona = await manager.get_default_persona_v3(umo or None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺读取人格失败，用默认口吻写: {exc}")
+            return ""
+        if not isinstance(persona, dict):
+            return ""
+        return str(persona.get("prompt") or "").strip()
+
+    async def _auto_write_tick(self) -> None:
+        """到点了：把今天攒的聊天交给模型，写成一篇日记。"""
+        if self._db is None:
+            return
+        # 一天只写一篇。定时任务万一被重载多排了一次，也不能写两篇、扣两次额度。
+        if self._auto_write_done_today():
+            logger.info("璃笺自动写日记：今天已经写过了，跳过")
+            return
+        try:
+            digest, count = await asyncio.to_thread(
+                self._db.material_digest, "", AUTO_MATERIAL_MAX_CHARS
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺读取聊天素材失败: {exc}")
+            return
+        # 先看够不够，不够就别调模型——这一步是在省钱。
+        if count < AUTO_MIN_MATERIAL or len(digest) < AUTO_MIN_MATERIAL_CHARS:
+            logger.info(
+                f"璃笺自动写日记：今天只攒到 {count} 条 / {len(digest)} 字，"
+                "不值得写，跳过（不调用模型）"
+            )
+            return
+        try:
+            provider = self.context.get_using_provider()
+        except Exception:  # noqa: BLE001
+            provider = None
+        if provider is None:
+            logger.warning("璃笺自动写日记：没有可用的模型提供商，跳过")
+            return
+        # 用哪个会话的 umo 取人格：素材里最后说话的那个。
+        session = ""
+        try:
+            pool = await asyncio.to_thread(self._db.material_pool)
+            if pool:
+                session = str(pool[-1].get("s") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        persona = await self._persona_prompt(session)
+        system_prompt = f"{persona}\n\n{AUTO_WRITE_SYSTEM}" if persona else AUTO_WRITE_SYSTEM
+        prompt = (
+            "下面是我和对方今天聊过的话，按时间顺序：\n\n"
+            f"{digest}\n\n"
+            "把今天写成一篇日记，用「我」的口吻，像自己写给自己的。\n"
+            "要求：\n"
+            "- 只写上面这些对话里真实发生的事和你说过的话，没出现的细节一律不要编\n"
+            "- 写你记住的片段和当时的感受，不要逐句复述对话\n"
+            "- 三百到六百字，用 Markdown，可以用小标题\n"
+            "- 直接给正文，不要加代码块，不要写「这是日记」之类的开场白"
+        )
+        try:
+            response = await provider.text_chat(
+                prompt=prompt, system_prompt=system_prompt
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺自动写日记调用模型失败: {exc}")
+            return
+        body = self._strip_code_fence(getattr(response, "completion_text", ""))
+        if not body:
+            logger.warning("璃笺自动写日记：模型返回了空正文，保留素材下次再试")
+            return
+        try:
+            note = await asyncio.to_thread(
+                self._db.write_diary_from_ai,
+                {
+                    "content_md": body,
+                    "title": None,
+                    "diary_date": None,
+                    "tags": ["日记", "自动"],
+                    "mode": "append_today",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺自动写日记写入失败: {exc}")
+            return
+        # 写成功了才清素材：这一次调用失败不该把今天的话一起丢掉。
+        try:
+            await asyncio.to_thread(self._db.material_clear)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺清空聊天素材失败: {exc}")
+        try:
+            self._db.state_set(
+                "auto_write",
+                {
+                    "date": local_today(),
+                    "note_id": note["id"],
+                    "chars": len(body),
+                    "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺记录自动写日记状态失败: {exc}")
+        logger.info(
+            f"璃笺自动写日记完成：{note['title']}"
+            f"（用了 {count} 条素材、{len(digest)} 字，写成 {len(body)} 字）"
+        )
 
     # ---------- 自动备份 ----------
 
@@ -405,24 +612,13 @@ class LijianPlugin(Star):
             return True
 
     def _backup_dir(self) -> Path:
-        configured = str(self.config.get("backup_dir", "") or "").strip()
-        if configured:
-            return Path(configured).expanduser()
         return self._data_dir / BACKUP_DIR_NAME
 
     def _backup_keep(self) -> int:
-        try:
-            keep = int(self.config.get("backup_keep", BACKUP_KEEP_DEFAULT))
-        except (TypeError, ValueError):
-            keep = BACKUP_KEEP_DEFAULT
-        return max(1, min(keep, 365))
+        return BACKUP_KEEP_DEFAULT
 
     def _backup_hour(self) -> int:
-        try:
-            hour = int(self.config.get("backup_hour", BACKUP_HOUR_DEFAULT))
-        except (TypeError, ValueError):
-            hour = BACKUP_HOUR_DEFAULT
-        return max(0, min(hour, 23))
+        return BACKUP_HOUR_DEFAULT
 
     def _backup_files(self) -> list[Path]:
         directory = self._backup_dir()
@@ -615,29 +811,60 @@ class LijianPlugin(Star):
 
     @filter.command("日记状态", alias={"lijian_status"})
     async def lijian_status(self, event: AstrMessageEvent):
-        """查看璃笺运行状态。"""
+        """看看日记本现在怎么样。"""
         if self._db is None:
-            yield event.plain_result("璃笺数据库不可用，请检查插件配置中的 db_path。")
+            yield event.plain_result("日记本打不开了，检查一下 AstrBot 的数据目录能不能写。")
             return
         try:
             stats = self._db.stats()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             stats = {"notes": 0, "words": 0, "archived": 0}
             logger.warning(f"璃笺统计失败: {exc}")
-        bridge_state = (
-            f"接口已启动：{self._bridge.host}:{self._bridge.port}"
-            if self._bridge_running()
-            else ("接口未启用" if self._bridge is None else "接口启动失败（端口占用？）")
-        )
-        token = self._db.settings()["ai_token"]
-        yield event.plain_result(
-            f"璃笺状态：正常\n"
-            f"数据库：{self._db.path}\n"
-            f"{bridge_state}\n"
-            f"写入令牌：{'已配置' if token else '未配置'}（可在书架页面复制）\n"
-            f"共 {stats.get('notes', 0)} 篇 · {stats.get('words', 0)} 字 · "
-            f"归档 {stats.get('archived', 0)} 篇"
-        )
+        try:
+            material_count = len(self._db.material_pool())
+        except Exception:  # noqa: BLE001
+            material_count = 0
+
+        lines = [
+            f"璃笺状态：正常 · 一共 {stats.get('notes', 0)} 篇，"
+            f"{stats.get('words', 0)} 字，归档 {stats.get('archived', 0)} 篇",
+            "",
+        ]
+        # 自动写日记：说人话，告诉她今晚会不会写、现在还差什么
+        if not self._auto_write_enabled():
+            lines.append("自己写日记：关了")
+        elif self._auto_write_done_today():
+            last = self._db.state_get("auto_write", {}) or {}
+            lines.append(
+                f"自己写日记：今天已经写好了"
+                f"（{last.get('at', '')}，{last.get('chars', 0)} 字）"
+            )
+        else:
+            enough = material_count >= AUTO_MIN_MATERIAL
+            tail = "够了" if enough else f"还不够，至少 {AUTO_MIN_MATERIAL} 条"
+            lines.append(
+                f"自己写日记：今晚 {self._auto_write_hour()}:00，"
+                f"今天攒了 {material_count} 条聊天（{tail}）"
+            )
+        # 回卷
+        if self._recall_enabled():
+            span = self._recall_days()
+            lines.append(f"记得你：最近 {span} 天" if span else "记得你：写过的事都翻")
+        else:
+            lines.append("记得你：关")
+        if self._backup_enabled():
+            lines.append(f"备份：每天一份，留最近 {BACKUP_KEEP_DEFAULT} 份")
+        else:
+            lines.append("备份：关")
+
+        # 出问题了才说，正常的时候不占地方
+        if not self._bridge_running():
+            lines.append("")
+            lines.append("本地写入接口没起来，可能是端口被上一个实例占着——不影响写日记，重启一次 AstrBot 就好。")
+
+        lines.append("")
+        lines.append("看书架：AstrBot 网页 → 插件 → 璃笺 → 页面")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("写日记", alias={"lijian_write"})
     async def lijian_write(self, event: AstrMessageEvent, content: str):

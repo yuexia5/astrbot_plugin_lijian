@@ -44,6 +44,8 @@ filter_mod = ModuleType("astrbot.api.event.filter")
 class AstrMessageEvent:
     def __init__(self, text="", private=True, session="sess-1"):
         self.text = text
+        self.message_str = text
+        self.unified_msg_origin = f"test:FriendMessage:{session}"
         self._private = private
         self._session = session
 
@@ -80,10 +82,18 @@ class _Filter:
 
         return decorate
 
+    def on_llm_response(self, priority=0):
+        def decorate(func):
+            func.__hook__ = "on_llm_response"
+            return func
+
+        return decorate
+
 
 filter_mod.command = _Filter().command
 filter_mod.llm_tool = _Filter().llm_tool
 filter_mod.on_llm_request = _Filter().on_llm_request
+filter_mod.on_llm_response = _Filter().on_llm_response
 event_mod.filter = filter_mod
 event_mod.AstrMessageEvent = AstrMessageEvent
 api.event = event_mod
@@ -112,9 +122,79 @@ star_mod = ModuleType("astrbot.api.star")
 class Context:
     def __init__(self):
         self.registered = []
+        self.cron_manager = FakeCronManager()
+        self.persona_manager = None
+        self.provider = None
 
     def register_web_api(self, route, handler, methods, desc):
         self.registered.append((route, methods, desc))
+
+    def get_using_provider(self, umo=None):
+        return self.provider
+
+
+class FakeCronJob:
+    def __init__(self, job_id, name):
+        self.job_id = job_id
+        self.name = name
+
+
+class FakeCronManager:
+    """够用的定时任务桩：记下排了什么，能列出、能删。"""
+
+    def __init__(self):
+        self.jobs = []
+        self.handlers = {}
+        self._seq = 0
+
+    async def list_jobs(self, job_type=None):
+        return list(self.jobs)
+
+    async def add_basic_job(
+        self,
+        *,
+        name,
+        cron_expression,
+        handler,
+        description=None,
+        persistent=False,
+        **kwargs,
+    ):
+        self._seq += 1
+        job = FakeCronJob(f"job-{self._seq}", name)
+        self.jobs.append(job)
+        self.handlers[job.job_id] = (cron_expression, handler)
+        return job
+
+    async def delete_job(self, job_id):
+        self.jobs = [job for job in self.jobs if job.job_id != job_id]
+        self.handlers.pop(job_id, None)
+
+
+class FakePersonaManager:
+    def __init__(self, prompt=""):
+        self.prompt = prompt
+
+    async def get_default_persona_v3(self, umo=None):
+        return {"name": "测试人格", "prompt": self.prompt}
+
+
+class FakeProvider:
+    """假的模型提供商：记住被调了几次、传了什么，返回预设正文。"""
+
+    def __init__(self, text="今天过得还行。"):
+        self.text = text
+        self.calls = []
+
+    async def text_chat(self, prompt=None, system_prompt=None, **kwargs):
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt})
+
+        class _Resp:
+            pass
+
+        resp = _Resp()
+        resp.completion_text = self.text
+        return resp
 
 
 class Star:
@@ -139,7 +219,10 @@ sys.modules["astrbot.api.star"] = star_mod
 core_mod = ModuleType("astrbot.core")
 utils_mod = ModuleType("astrbot.core.utils")
 path_mod = ModuleType("astrbot.core.utils.astrbot_path")
-path_mod.get_astrbot_plugin_data_path = lambda: "/tmp/opencode/lijian-mock-data"
+# 数据目录现在写死在插件数据目录下（没有 db_path 配置项了），
+# 用可变容器让每个用例能把根目录指到自己的临时目录里。
+MOCK_DATA_ROOT = {"path": "/tmp/opencode/lijian-mock-data"}
+path_mod.get_astrbot_plugin_data_path = lambda: MOCK_DATA_ROOT["path"]
 utils_mod.astrbot_path = path_mod
 core_mod.utils = utils_mod
 sys.modules["astrbot.core"] = core_mod
@@ -226,21 +309,22 @@ def check(name, cond, detail=""):
 
 
 with tempfile.TemporaryDirectory() as tmp:
+    # 数据目录、端口、备份份数都不再是配置项，改由模块常量决定；
+    # 测试里把它们指到临时目录 / 空闲端口，别撞上正在跑的 AstrBot。
+    MOCK_DATA_ROOT["path"] = tmp
+    plugin_main.BRIDGE_PORT = free_port()
+    plugin_main.BACKUP_KEEP_DEFAULT = 3
+    plugin_main.BACKUP_HOUR_DEFAULT = 0
+    # 只剩五个真配置项，其余全写死
     config = AstrBotConfig(
         {
-            "db_path": str(Path(tmp) / "lijian.sqlite3"),
-            "bridge_host": "127.0.0.1",
-            "bridge_port": free_port(),
-            "bridge_enabled": True,
-            "token": "",
             "default_mode": "append_today",
-            # 备份指到临时目录，顺带验证「启动时补备份」这条路。
+            "recall_enabled": True,
+            "recall_days": 7,
             "backup_enabled": True,
-            "backup_dir": str(Path(tmp) / "backups"),
-            "backup_keep": 3,
-            "backup_hour": 0,
         }
     )
+    data_root = Path(tmp) / plugin_main.PLUGIN_NAME
     ctx = Context()
     plugin = plugin_main.LijianPlugin(ctx, config)
     check("plugin registered", plugin_main.LijianPlugin.__registered__[0] == "astrbot_plugin_lijian")
@@ -264,14 +348,14 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     check(
         "db opened",
-        Path(tmp, "lijian.sqlite3").exists() and plugin._db is not None,
+        (data_root / "lijian.sqlite3").exists() and plugin._db is not None,
     )
     token = plugin._db.settings()["ai_token"]
     check("token auto generated", token.startswith("lijian-"))
     check("bridge running", plugin._bridge is not None and plugin._bridge.running)
     check(
         "backup created at startup",
-        len(list((Path(tmp) / "backups").glob("lijian-*.json.gz"))) == 1,
+        len(list((data_root / "backups").glob("lijian-*.json.gz"))) == 1,
     )
     check("web apis registered", len(ctx.registered) == 26)
     routes = {route for route, _, _ in ctx.registered}
@@ -300,7 +384,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
         # 指令（async generator）
         lines = [line async for line in plugin.lijian_status(AstrMessageEvent())]
-        check("command status", "已配置" in lines[0] and "接口已启动" in lines[0])
+        check(
+            "command status is plain spoken",
+            "璃笺状态：正常" in lines[0] and "自己写日记" in lines[0],
+            lines[0][:80],
+        )
         lines = [line async for line in plugin.lijian_list(AstrMessageEvent(), 5)]
         check("command list", "璃笺书架" in lines[0])
 
@@ -404,10 +492,10 @@ with tempfile.TemporaryDirectory() as tmp:
 
         # Web API: 立即备份 + 列表 + 从 gz 恢复
         # 恢复时的临时文件走 _data_dir，指到临时目录，别在 /tmp 里留东西。
-        plugin._data_dir = Path(tmp)
+        plugin._data_dir = data_root
         response = await plugin.api_backup_now()
         info = response["_json"]["backup"]
-        backup_path = Path(tmp) / "backups" / info["file"]
+        backup_path = data_root / "backups" / info["file"]
         check("api backup now writes file", backup_path.is_file() and info["bytes"] > 0)
         check("api backup now counts notes", info["count"] >= 1)
         response = await plugin.api_list_backups()
@@ -422,9 +510,9 @@ with tempfile.TemporaryDirectory() as tmp:
 
         # 超出保留份数的旧备份要被清掉
         for index in range(5):
-            (Path(tmp) / "backups" / f"lijian-2020010{index}-000000.json.gz").write_bytes(b"old")
+            (data_root / "backups" / f"lijian-2020010{index}-000000.json.gz").write_bytes(b"old")
         response = await plugin.api_backup_now()
-        kept = sorted((Path(tmp) / "backups").glob("lijian-*.json.gz"))
+        kept = sorted((data_root / "backups").glob("lijian-*.json.gz"))
         check("api backup prunes old files", len(kept) == 3, len(kept))
         check("api backup keeps newest", kept[-1].name.startswith("lijian-2026"))
 
@@ -504,7 +592,7 @@ with tempfile.TemporaryDirectory() as tmp:
         response = await plugin.api_upload_media()
         check("api upload needs file", "缺少" in str(response.get("_error", "")), response)
         request_proxy._files = {}
-        plugin._data_dir = Path(tmp)
+        plugin._data_dir = data_root
 
         # Web API: diary write + markdown + status + stats
         request_proxy._body = {"content_md": "页面上写的", "tags": ["页面"]}
@@ -631,6 +719,94 @@ with tempfile.TemporaryDirectory() as tmp:
             plugin._db = keep
 
     asyncio.run(run_recall())
+
+    async def run_auto_write():
+        # 定时任务：注册一次，重载不叠加
+        await plugin.initialize()
+        check("auto write job registered", len(ctx.cron_manager.jobs) == 1)
+        job = ctx.cron_manager.jobs[0]
+        expression, handler = ctx.cron_manager.handlers[job.job_id]
+        check("auto write cron expression", expression == "0 23 * * *", expression)
+        check("auto write handler bound", handler == plugin._auto_write_tick)
+        await plugin.initialize()
+        check("auto write job not duplicated", len(ctx.cron_manager.jobs) == 1)
+
+        # 素材采集：双方的话都要留下，群里的话一句不留
+        plugin._db.material_clear()
+        private_event = AstrMessageEvent(text="今天累不累", private=True, session="sess-p")
+
+        def _reply(text):
+            return type("R", (), {"completion_text": text})()
+
+        await plugin.collect_material_on_request(private_event, ProviderRequest())
+        await plugin.collect_material_on_response(private_event, _reply("还行，你呢"))
+        pool = plugin._db.material_pool()
+        check("material collected", len(pool) == 2, len(pool))
+        check("material roles", [item["r"] for item in pool] == ["user", "assistant"])
+        await plugin.collect_material_on_response(private_event, _reply("还行，你呢"))
+        check("material dedupes repeat", len(plugin._db.material_pool()) == 2)
+        group_event = AstrMessageEvent(text="群里说一句", private=False, session="g1")
+        await plugin.collect_material_on_request(group_event, ProviderRequest())
+        check("material skipped in group", len(plugin._db.material_pool()) == 2)
+
+        # 没素材时一个 token 都不该花
+        provider = FakeProvider("不该被调用")
+        ctx.provider = provider
+        plugin._db.material_clear()
+        plugin._db.state_set("auto_write", {})
+        await plugin._auto_write_tick()
+        check("auto write skips when empty", provider.calls == [])
+
+        # 素材够了才写，并且要用设好的人格口吻
+        for index in range(8):
+            plugin._db.material_append(
+                "test:FriendMessage:sess-p",
+                "user" if index % 2 == 0 else "assistant",
+                f"第{index}条聊天内容，说了一些今天发生的事，凑够字数用。",
+            )
+        ctx.persona_manager = FakePersonaManager("你是白薇，主人的女仆，说话简短。")
+        provider = FakeProvider("```markdown\n## 今天\n\n聊了很久，也累了。\n```")
+        ctx.provider = provider
+        await plugin._auto_write_tick()
+        check("auto write calls model once", len(provider.calls) == 1, len(provider.calls))
+        check(
+            "auto write uses persona",
+            "白薇" in str(provider.calls[0]["system_prompt"]),
+            provider.calls[0]["system_prompt"][:60],
+        )
+        check(
+            "auto write feeds material",
+            "第0条聊天内容" in str(provider.calls[0]["prompt"]),
+        )
+        check("auto write clears material", len(plugin._db.material_pool()) == 0)
+        check("auto write marks today", plugin._auto_write_done_today())
+        wrote = plugin._db.search_notes("聊了很久")
+        check("auto write saved note", len(wrote) >= 1)
+        check("auto write strips fence", "```" not in wrote[0]["body_md"])
+
+        # 同一天再触发也不许再写一遍——这是额度
+        provider = FakeProvider("第二次不该发生")
+        ctx.provider = provider
+        plugin._db.material_append(
+            "test:FriendMessage:sess-p", "user", "又聊了两句，但今天已经写过了。"
+        )
+        await plugin._auto_write_tick()
+        check("auto write once per day", provider.calls == [])
+
+        # 关掉开关就不排程
+        plugin.config["auto_write_enabled"] = False
+        await plugin.initialize()
+        check("auto write job removed when off", ctx.cron_manager.jobs == [])
+        plugin.config["auto_write_enabled"] = True
+
+        # 代码块剥离的单测
+        check("strip fence plain", plugin._strip_code_fence("正文") == "正文")
+        check(
+            "strip fence marked",
+            plugin._strip_code_fence("```markdown\n正文\n```") == "正文",
+        )
+
+    asyncio.run(run_auto_write())
 
     plugin.terminate_sync = None
     asyncio.run(plugin.terminate())

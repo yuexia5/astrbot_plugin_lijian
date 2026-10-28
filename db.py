@@ -54,6 +54,18 @@ CREATE TABLE IF NOT EXISTS write_events (
     created_at TEXT NOT NULL,
     FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
 );
+
+-- 自动写日记的素材池。每轮聊天追加一行，到点拿去让模型写，写完清掉。
+-- 单独建表而不是塞进 settings：一天几百轮对话，每次整份 JSON 读改写会很拖。
+CREATE TABLE IF NOT EXISTS diary_materials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_materials_created ON diary_materials(created_at);
 """
 
 
@@ -778,6 +790,92 @@ class Database:
     def state_set(self, key: str, value: Any) -> None:
         with self._lock:
             self._set_setting_json(f"state:{key}", value)
+
+    # ---------- 自动写日记的素材池 ----------
+    #
+    # 日记要有人写，可 AI 到点就忘了今天聊过什么。所以在每轮聊天时顺手把
+    # 双方的话攒一点下来，到点一次性交给模型去写。
+    # 单独一张表，只做插入和按序取：聊得再多也不会因为整份读写而拖慢聊天。
+
+    # 攒太多没意义：一天聊上千句是刷屏不是生活，留最近这些够了。
+    MATERIAL_MAX_ITEMS = 400
+    MATERIAL_ITEM_CHARS = 600
+
+    def material_append(self, session: str, role: str, content: str) -> bool:
+        """记一条素材。返回是否真的记下了（空的、跟上一条重复的会丢掉）。"""
+        text = " ".join(str(content or "").split()).strip()
+        if not text:
+            return False
+        if len(text) > self.MATERIAL_ITEM_CHARS:
+            text = text[: self.MATERIAL_ITEM_CHARS] + "…"
+        with self._lock:
+            # 工具调用会让同一个钩子跑好几轮，同一句话别记第二遍
+            last = self.conn.execute(
+                "SELECT role, content FROM diary_materials ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if last is not None and last["role"] == role and last["content"] == text:
+                return False
+            self.conn.execute(
+                "INSERT INTO diary_materials (session, role, content, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (str(session or ""), role, text, now()),
+            )
+            # 只留最近 MATERIAL_MAX_ITEMS 条，超出的当场删掉，别让表无限长
+            self.conn.execute(
+                "DELETE FROM diary_materials WHERE id NOT IN ("
+                "SELECT id FROM diary_materials ORDER BY id DESC LIMIT ?)",
+                (self.MATERIAL_MAX_ITEMS,),
+            )
+            self._persist()
+        return True
+
+    def material_pool(self, since: str = "") -> list[dict[str, Any]]:
+        """按时间正序取素材。字段名保持 t/s/r/c，调用方不用关心表结构。"""
+        sql = "SELECT session, role, content, created_at FROM diary_materials"
+        params: tuple[Any, ...] = ()
+        if since:
+            sql += " WHERE created_at >= ?"
+            params = (since,)
+        sql += " ORDER BY id ASC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [
+            {
+                "t": row["created_at"],
+                "s": row["session"],
+                "r": row["role"],
+                "c": row["content"],
+            }
+            for row in rows
+        ]
+
+    def material_digest(
+        self, since: str = "", max_chars: int = 8000
+    ) -> tuple[str, int]:
+        """把素材拼成一段对话记录，超预算从最旧的砍。返回 (文本, 条数)。"""
+        pool = self.material_pool(since)
+        lines: list[str] = []
+        used = 0
+        for item in reversed(pool):
+            who = "对方" if item.get("r") == "user" else "我"
+            line = f"{who}：{item.get('c', '')}"
+            if lines and used + len(line) > max_chars:
+                break
+            lines.append(line)
+            used += len(line)
+        lines.reverse()
+        return "\n".join(lines), len(lines)
+
+    def material_clear(self) -> int:
+        """写完日记就把素材清掉，免得下一篇又嚼一遍旧料。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM diary_materials"
+            ).fetchone()
+            count = int(row["n"]) if row is not None else 0
+            self.conn.execute("DELETE FROM diary_materials")
+            self._persist()
+        return count
 
     def _get_setting(self, key: str) -> Optional[str]:
         row = self.conn.execute(

@@ -1,108 +1,46 @@
 {
-  "bridge_enabled": {
-    "description": "启用本地写入接口",
+  "auto_write_enabled": {
+    "description": "每天自己写日记",
     "type": "bool",
     "default": true,
-    "hint": "监听本机端口，兼容桌面版璃笺的 HTTP 写入接口。"
+    "hint": "到点把今天聊过的话写成一篇日记，不用你开口。当天没聊够就不写，不会瞎编。"
   },
-  "bridge_host": {
-    "description": "接口监听地址",
-    "type": "string",
-    "default": "127.0.0.1",
-    "hint": "只在本机使用请保持 127.0.0.1。改成 0.0.0.0 会把接口暴露到局域网，请自行确认风险。"
-  },
-  "bridge_port": {
-    "description": "接口监听端口",
+  "auto_write_hour": {
+    "description": "几点写",
     "type": "int",
-    "default": 27176,
-    "hint": "与桌面版璃笺默认端口一致。修改后需重载插件。"
+    "default": 23,
+    "hint": "默认晚上 11 点，0-23。改完重载插件生效。"
   },
-  "db_path": {
-    "description": "数据库文件路径",
-    "type": "string",
-    "default": "",
-    "hint": "留空使用插件数据目录；填写已有 lijian.sqlite3 的完整路径可直接迁移旧数据。"
+  "recall_enabled": {
+    "description": "让她记得",
+    "type": "bool",
+    "default": true,
+    "hint": "重载插件或隔了很久再聊时，AI 会先翻一遍最近写的日记，接上上次的话。关掉就是每次都要你重新交代。"
   },
-  "token": {
-    "description": "写入令牌",
-    "type": "string",
-    "default": "",
-    "hint": "留空自动生成（首次写入数据库）。填写桌面版璃笺的 AI 写入令牌可保持兼容。"
+  "recall_days": {
+    "description": "往回记得多少天",
+    "type": "int",
+    "default": 7,
+    "hint": "默认 7 天。填 0 表示不限日期，只取最近几篇。"
   },
   "default_mode": {
-    "description": "默认写入模式",
+    "description": "AI 写日记时怎么落笔",
     "type": "string",
     "default": "append_today",
     "options": ["append_today", "create"],
-    "labels": ["追加到今日日记", "创建新日记"],
-    "hint": "工具调用未指定 mode 时使用。"
+    "labels": ["接到今天那篇后面", "另起一篇新的"],
+    "hint": "默认接到今天那篇后面，一天一篇，不会碎成一地。"
   },
   "diary_template": {
-    "description": "新日记模板",
+    "description": "新日记的模板",
     "type": "text",
     "default": "**天气**：\n**心情**：\n\n## 今天做了什么\n\n- \n\n## 三件小事\n\n1. \n2. \n3. \n",
-    "hint": "书架页点「新日记」时自动填入。{date} 会替换成当天日期；清空则新建空白日记。"
-  },
-  "recall_enabled": {
-    "description": "开新上下文时自动回卷",
-    "type": "bool",
-    "default": true,
-    "hint": "重载插件或开新会话后，AI 第一次说话前会自己翻一遍最近几天写下的日记，不用你重新交代。"
-  },
-  "recall_days": {
-    "description": "回卷翻几天",
-    "type": "int",
-    "default": 7,
-    "hint": "往回翻多少天以内的日记。0 表示不分日期，按篇数取最近的。"
-  },
-  "recall_limit": {
-    "description": "回卷最多翻几篇",
-    "type": "int",
-    "default": 5,
-    "hint": "1-20。太少会接不上，太多会占上下文。"
-  },
-  "recall_max_chars": {
-    "description": "回卷字数上限",
-    "type": "int",
-    "default": 2400,
-    "hint": "所有翻出来的日记加起来最多这么多字，超了从最旧的开始截。"
-  },
-  "recall_scope": {
-    "description": "回卷生效范围",
-    "type": "string",
-    "default": "private",
-    "options": ["private", "all"],
-    "labels": ["只在私聊", "私聊和群聊都翻"],
-    "hint": "日记是私事。默认只在私聊里回卷，免得 AI 在群里把日记内容说给一群人听。"
-  },
-  "recall_gap_hours": {
-    "description": "隔多久再翻一次",
-    "type": "int",
-    "default": 6,
-    "hint": "同一个会话里已经翻过了，隔这么多小时没说话才会再翻。0 表示每次新上下文只翻一次。"
+    "hint": "书架页点「新日记」时自动填进去。{date} 会换成当天日期；清空就是一张白纸。"
   },
   "backup_enabled": {
     "description": "自动备份",
     "type": "bool",
     "default": true,
-    "hint": "每天自动把整个书库压成一份备份，放在数据目录的 backups/ 下。"
-  },
-  "backup_hour": {
-    "description": "备份时间（点）",
-    "type": "int",
-    "default": 3,
-    "hint": "每天这个点之后补一次备份，0-23。插件启动时如果发现当天还没备份，会立刻补。"
-  },
-  "backup_keep": {
-    "description": "备份保留份数",
-    "type": "int",
-    "default": 30,
-    "hint": "超过这个数量的旧备份自动删掉，1-365。"
-  },
-  "backup_dir": {
-    "description": "备份目录",
-    "type": "string",
-    "default": "",
-    "hint": "留空放在插件数据目录的 backups/ 下；填路径可以放到别的大盘上。"
+    "hint": "每天凌晨把整个书库压成一份，放在数据目录的 backups/ 下，留最近 30 份。"
   }
 }
