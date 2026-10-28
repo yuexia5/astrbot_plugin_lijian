@@ -324,7 +324,9 @@ def test_recall_and_streak():
     # 10-16 只有便签，不算日记，所以 17 号往回数一天就断了
     check("streak ignores notes", db.diary_streak("2026-10-17") == 1)
     check("streak zero when far away", db.diary_streak("2026-11-30") == 0)
-    check("stats exposes streak", db.stats()["streak"] == 3)
+    # stats() 里的 streak 用的是「真实的今天」，而这里造的数据是写死的日期，
+    # 直接比数字会随着跑测试的日子越来越旧而挂掉。改比「与 diary_streak 一致」。
+    check("stats exposes streak", db.stats()["streak"] == db.diary_streak())
 
     db.state_set("last_backup", {"date": "2026-10-19", "file": "x.json.gz"})
     check("state roundtrip", db.state_get("last_backup")["file"] == "x.json.gz")

@@ -8,9 +8,13 @@
 
 - **日记库本体**：SQLite 存储（`notes` / `settings` / `write_events`），
   支持日记 / 便签两种类型、标签、置顶、归档。
-- **LLM 工具**：`write_lijian_diary` / `list_lijian_notes` / `read_lijian_note` /
-  `update_lijian_note` / `delete_lijian_note` / `lijian_weekly`，让 AI 写日记、读日记、归档、取周报素材。
-- **指令**：`/lijian_status` `/lijian_write` `/lijian_list` `/lijian_read` `/lijian_delete`。
+- **LLM 工具**：`write_lijian_diary` / `list_lijian_notes` / `search_lijian_notes` /
+  `read_lijian_note` / `update_lijian_note` / `delete_lijian_note` / `lijian_weekly`，
+  让 AI 写日记、翻旧事、归档、取周报素材。
+- **回卷**：新上下文（重载插件、换会话、隔了几小时再聊）里，AI 开口之前会先把最近几天的日记
+  翻一遍再说话，不用你重新交代「我们上次说到哪」。只在私聊里翻，群聊不碰。
+- **指令**：`/lijian_status` `/lijian_write` `/lijian_list` `/lijian_read` `/lijian_delete`
+  `/lijian_recall`。
 - **本地写入接口**：默认监听 `127.0.0.1:27176`，提供与 AI 桥相同的
   `POST /api/v1/diary` 等 HTTP 接口，外部脚本 / 自动任务可以直接调。
 - **书架页面**：AstrBot WebUI 插件详情页里的「璃笺书架」——日记是书架上的一本本书，
@@ -36,6 +40,12 @@
 | `token` | 写入令牌。**留空则首次启动时自动生成随机令牌**；若手动填写，则每次启动都会以此值覆盖为当前令牌 |
 | `default_mode` | 工具未指定 mode 时的写入模式（append_today / create） |
 | `diary_template` | 书架页新建日记时自动填入的模板，`{date}` 会替换成当天日期；留空则新建空白日记 |
+| `recall_enabled` | 新上下文时是否自动回卷（默认开） |
+| `recall_days` | 回卷往回翻几天（默认 7，0 表示不限日期、只按篇数） |
+| `recall_limit` | 最多翻几篇（默认 5，1-20） |
+| `recall_max_chars` | 翻出来的日记总字数上限（默认 2400，超了从最旧的开始截） |
+| `recall_scope` | `private` 只在私聊翻（默认）／`all` 群聊也翻 |
+| `recall_gap_hours` | 同一个会话隔多少小时再翻一次（默认 6，0 表示每次新上下文只翻一次） |
 | `backup_enabled` | 是否每天自动备份整库（默认开） |
 | `backup_hour` | 每天几点之后补备份（默认 3 点，0-23） |
 | `backup_keep` | 备份保留份数（默认 30，超出按文件名删最旧的） |
@@ -59,6 +69,26 @@
 - `GET /api/v1/events` — SSE 事件流，书架有变动时推送 `notes_changed`（`?token=` 只接受本机连接）
 
 `{id}` 支持唯一前缀，指令里显示的 8 位 id 可以直接拿来读。
+
+## 回卷
+
+日记写下来是给谁看的？给下一次醒过来的那个自己。
+
+AstrBot 重载、会话换了、或者隔了半天没说话，AI 的上下文就空了——它不记得昨天聊过什么。
+回卷就是把这个空补上：在你开口之前，它先翻一遍最近几天的日记，再回答你。
+
+- **翻什么**：最近 `recall_days` 天内的日记，只要日记，不要便签，最多 `recall_limit` 篇。
+- **怎么翻**：从最新往回塞，总字数卡在 `recall_max_chars` 以内；最旧的先被牺牲。
+- **翻完怎么办**：那段内容进系统提示词，AI 当作自己的记忆用，但不许说「根据日记」、
+  也不许向你复述——它只是自然记得。
+- **翻几次**：同一个会话翻一次就记住。隔了 `recall_gap_hours` 小时没说话才会再翻，
+  免得一天聊十轮塞十遍、白烧 token。
+- **翻给谁看**：默认只在私聊。日记是私事，`recall_scope` 保持 `private` 比较稳妥。
+
+想看下一次会翻哪几篇，发 `/lijian_recall`，它会列出日期和标题，不贴正文。
+
+AI 想主动回忆某件事时，可以用 `search_lijian_notes` 按关键词和日期范围自己翻，
+只拿摘要和命中处的一小段，需要读全文再按 id 取。
 
 ## 让 AI 每天自动写日记
 
@@ -145,6 +175,20 @@
 - **绑定到 `0.0.0.0`** 会让同网段的人拿着令牌就能读写，启动时会打警告。不需要就别改。
 
 ## 更新日志
+
+### v1.3.0
+
+这一版把重心往「记忆」拉回来：日记不只是存在架子上的书，还得有人翻。
+
+- 新：**回卷**。新上下文里 AI 开口前自动翻最近几天的日记，接着上次的记忆说话，
+  不再一重载就失忆。同一会话只翻一次，隔 `recall_gap_hours` 小时才重翻，字数有硬上限。
+- 新：`search_lijian_notes` 工具。AI 能按关键词 + 日期范围主动翻旧事，
+  返回摘要和命中处上下文片段，比 `list_lijian_notes` 更适合「想起某件事」。
+- 新：`/lijian_recall` 指令，预览下次会翻哪几篇。
+- 新：`recall_*` 六项配置，可关、可调天数篇数字数、可决定群聊要不要翻。
+- 修：本地接口热重载时端口常被上一个实例占住，`bind` 一次失败就放弃。
+  现在退避重试 4 次，重载不再随机丢掉桥接。
+- 修：`test_smoke.py` 里 streak 断言跟着写死的日期一起腐化，改成与 `diary_streak()` 对齐。
 
 ### v1.2.2
 

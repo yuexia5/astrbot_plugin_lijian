@@ -43,6 +43,44 @@
     "default": "**天气**：\n**心情**：\n\n## 今天做了什么\n\n- \n\n## 三件小事\n\n1. \n2. \n3. \n",
     "hint": "书架页点「新日记」时自动填入。{date} 会替换成当天日期；清空则新建空白日记。"
   },
+  "recall_enabled": {
+    "description": "开新上下文时自动回卷",
+    "type": "bool",
+    "default": true,
+    "hint": "重载插件或开新会话后，AI 第一次说话前会自己翻一遍最近几天写下的日记，不用你重新交代。"
+  },
+  "recall_days": {
+    "description": "回卷翻几天",
+    "type": "int",
+    "default": 7,
+    "hint": "往回翻多少天以内的日记。0 表示不分日期，按篇数取最近的。"
+  },
+  "recall_limit": {
+    "description": "回卷最多翻几篇",
+    "type": "int",
+    "default": 5,
+    "hint": "1-20。太少会接不上，太多会占上下文。"
+  },
+  "recall_max_chars": {
+    "description": "回卷字数上限",
+    "type": "int",
+    "default": 2400,
+    "hint": "所有翻出来的日记加起来最多这么多字，超了从最旧的开始截。"
+  },
+  "recall_scope": {
+    "description": "回卷生效范围",
+    "type": "string",
+    "default": "private",
+    "options": ["private", "all"],
+    "labels": ["只在私聊", "私聊和群聊都翻"],
+    "hint": "日记是私事。默认只在私聊里回卷，免得 AI 在群里把日记内容说给一群人听。"
+  },
+  "recall_gap_hours": {
+    "description": "隔多久再翻一次",
+    "type": "int",
+    "default": 6,
+    "hint": "同一个会话里已经翻过了，隔这么多小时没说话才会再翻。0 表示每次新上下文只翻一次。"
+  },
   "backup_enabled": {
     "description": "自动备份",
     "type": "bool",

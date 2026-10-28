@@ -1,9 +1,10 @@
 """璃笺 AstrBot 插件：无头环境下的日记与便签书库。
 
 把桌面版璃笺（Tauri）的存储与写入接口移植进 AstrBot：
-- 指令：/lijian_status /lijian_write /lijian_list /lijian_read /lijian_delete
-- LLM 工具：write_lijian_diary / list_lijian_notes / read_lijian_note /
+- 指令：/lijian_status /lijian_write /lijian_list /lijian_read /lijian_delete /lijian_recall
+- LLM 工具：write_lijian_diary / list_lijian_notes / search_lijian_notes / read_lijian_note /
   update_lijian_note / delete_lijian_note / lijian_weekly
+- 回卷：开新上下文时自动把最近几天的日记翻给 AI 看，让它接着上次的记忆说话
 - 本地写入接口：监听 127.0.0.1:27176，与桌面版璃笺 API 兼容
 - WebUI 页面：书架 (pages/bookshelf)，含那年今天、连续天数
 - 自动备份：每天把整库压成 .json.gz，放在数据目录的 backups/ 下，只留最近 N 份
@@ -26,6 +27,7 @@ from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -101,7 +103,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.3.0"
 
 
 @register(
@@ -117,6 +119,9 @@ class LijianPlugin(Star):
         self._db: Database | None = None
         self._bridge: BridgeServer | None = None
         self._backup_task: asyncio.Task | None = None
+        # 回卷记性：会话 -> 上次翻日记的时间（单调时钟秒）。
+        # 放内存里是有意的——插件重载即等于「换了个人醒过来」，那时正该重新翻书。
+        self._recalled: dict[str, float] = {}
         self._data_dir = self._resolve_data_dir()
         try:
             self._open_database()
@@ -201,6 +206,186 @@ class LijianPlugin(Star):
                 f"璃笺本地接口启动失败（端口 {host}:{port} 可能被占用），"
                 "写入仅能通过指令 / LLM 工具 / 书架页面进行。"
             )
+
+    # ---------- 回卷：让 AI 自己把日记翻回来 ----------
+
+    def _recall_enabled(self) -> bool:
+        try:
+            return bool(self.config.get("recall_enabled", True))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _recall_days(self) -> int:
+        try:
+            days = int(self.config.get("recall_days", 7))
+        except (TypeError, ValueError):
+            days = 7
+        return max(0, min(days, 365))
+
+    def _recall_limit(self) -> int:
+        try:
+            limit = int(self.config.get("recall_limit", 5))
+        except (TypeError, ValueError):
+            limit = 5
+        return max(1, min(limit, 20))
+
+    def _recall_max_chars(self) -> int:
+        try:
+            chars = int(self.config.get("recall_max_chars", 2400))
+        except (TypeError, ValueError):
+            chars = 2400
+        return max(300, min(chars, 20000))
+
+    def _recall_scope(self) -> str:
+        scope = str(self.config.get("recall_scope", "private") or "private")
+        return scope if scope in ("private", "all") else "private"
+
+    def _recall_gap_seconds(self) -> float:
+        try:
+            hours = int(self.config.get("recall_gap_hours", 6))
+        except (TypeError, ValueError):
+            hours = 6
+        hours = max(0, min(hours, 720))
+        return float(hours) * 3600.0
+
+    def _recall_candidates(self) -> list[dict[str, Any]]:
+        """挑出该翻给 AI 看的日记：只要日记，不要便签；不带归档的。"""
+        db = self._require_db()
+        notes = db.list_notes(include_archived=False)
+        cutoff = ""
+        days = self._recall_days()
+        if days > 0:
+            cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        picked: list[dict[str, Any]] = []
+        for note in notes:
+            if note.get("kind") != "diary":
+                continue
+            stamp = str(note.get("diary_date") or note.get("updated_at") or "")[:10]
+            if cutoff and stamp and stamp < cutoff:
+                continue
+            picked.append(note)
+        # 日记日期新的在前；同一天按更新时间排。
+        picked.sort(
+            key=lambda n: (
+                str(n.get("diary_date") or "")[:10],
+                str(n.get("updated_at") or ""),
+            ),
+            reverse=True,
+        )
+        return picked[: self._recall_limit()]
+
+    @staticmethod
+    def _recall_stamp(note: dict[str, Any]) -> str:
+        raw = str(note.get("diary_date") or note.get("created_at") or "")[:10]
+        try:
+            day = datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            return raw or "未标日期"
+        weekday = "一二三四五六日"[day.weekday()]
+        return f"{raw} 周{weekday}"
+
+    def _compose_recall(self, notes: list[dict[str, Any]]) -> str:
+        """把几篇日记缝成一段给 AI 的「翻书页」。
+
+        预算是硬的：从最新往回塞，塞不下就停，最后一篇超了按剩余额度截断。
+        最旧的先被牺牲，因为最近几天才是接得上话的那部分。
+        """
+        budget = self._recall_max_chars()
+        chunks: list[str] = []
+        used = 0
+        for note in notes:
+            body = str(note.get("body_md") or "").strip()
+            if not body:
+                continue
+            title = str(note.get("title") or "").strip()
+            head = f"· {self._recall_stamp(note)}"
+            if title:
+                head += f"｜{title}"
+            piece = f"{head}\n{body}"
+            room = budget - used
+            if room <= 80:
+                break
+            if len(piece) > room:
+                piece = piece[: max(0, room - 12)].rstrip() + "\n…（后略）"
+            chunks.append(piece)
+            used += len(piece) + 2
+            if used >= budget:
+                break
+        if not chunks:
+            return ""
+        return (
+            "【璃笺 · 回卷】\n"
+            "下面这段是先前的你写下的日记。它就是你自己的记忆，直接当作经历过的事来用：\n"
+            "不要向对方复述日记内容，不要说「根据日记」「记录里写着」这类话，"
+            "也不要在句尾补充说明你读过它。自然地记得就够了。\n\n"
+            + "\n\n".join(chunks)
+            + "\n【回卷结束】"
+        )
+
+    def _recall_due(self, key: str) -> bool:
+        last = self._recalled.get(key)
+        if last is None:
+            return True
+        gap = self._recall_gap_seconds()
+        if gap <= 0:
+            return False
+        return (time.monotonic() - last) >= gap
+
+    @filter.on_llm_request()
+    async def recall_before_llm(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """每次请求前判断：这个人（这个会话）是不是刚醒过来，该翻一遍日记了。
+
+        同一个会话翻过一次就记住，不重复占上下文；隔了 recall_gap_hours
+        没说话才会再翻，免得一天聊十轮塞十遍。
+        """
+        if not self._recall_enabled() or self._db is None:
+            return
+        if self._recall_scope() == "private" and not event.is_private_chat():
+            return
+        try:
+            key = str(req.session_id or event.get_session_id() or "")
+        except Exception:  # noqa: BLE001
+            key = ""
+        if not key:
+            return
+        if not self._recall_due(key):
+            return
+        try:
+            block = await asyncio.to_thread(self._compose_recall, self._recall_candidates())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺回卷失败: {exc}")
+            return
+        if not block:
+            return
+        base = req.system_prompt or ""
+        req.system_prompt = f"{base}\n\n{block}" if base else block
+        self._recalled[key] = time.monotonic()
+        logger.info(f"璃笺回卷：已翻给 {key} 看，{len(block)} 字")
+
+    @filter.command("lijian_recall")
+    async def lijian_recall(self, event: AstrMessageEvent):
+        """看看下次开新上下文时，璃笺会翻哪几篇日记给 AI。"""
+        if self._db is None:
+            yield event.plain_result("璃笺数据库不可用。")
+            return
+        try:
+            notes = self._recall_candidates()
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"回卷预览失败：{exc}")
+            return
+        if not notes:
+            yield event.plain_result(
+                f"最近 {self._recall_days() or '全部'} 天里还没有日记，回卷时没东西可翻。"
+            )
+            return
+        lines = [f"下次回卷会翻这 {len(notes)} 篇："]
+        for note in notes:
+            title = str(note.get("title") or "").strip() or "（无标题）"
+            lines.append(f"· {self._recall_stamp(note)}｜{title}")
+        lines.append(f"字数上限 {self._recall_max_chars()}，超了从最旧的开始截。")
+        yield event.plain_result("\n".join(lines))
 
     # ---------- 自动备份 ----------
 
@@ -593,6 +778,99 @@ class LijianPlugin(Star):
             return self._tool_error("璃笺列表读取失败", exc)
         return json.dumps(
             {"ok": True, "notes": [self._summary(note) for note in notes]},
+            ensure_ascii=False,
+        )
+
+    @filter.llm_tool(name="search_lijian_notes")
+    async def search_lijian_notes(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        since: str = "",
+        until: str = "",
+        limit: int = 8,
+    ):
+        """在自己写过的日记和便签里翻找。想回忆某件事、某个人、某段时间发生过什么时用它。
+
+        只拿到摘要和命中处的一小段原文；想读全文再用 read_lijian_note 按 id 取。
+
+        Args:
+            keyword(string): 要找的词，中文两个字也命中。留空表示不限关键词。
+            since(string): 起始日期，格式 YYYY-MM-DD，可为空表示不限。
+            until(string): 截止日期，格式 YYYY-MM-DD，可为空表示不限。
+            limit(int): 最多返回几条，默认 8，上限 50。
+        """
+        if self._db is None:
+            return self._tool_error("璃笺检索失败", RuntimeError("数据库不可用"))
+        try:
+            limit = max(1, min(int(limit or 8), 50))
+        except (TypeError, ValueError):
+            limit = 8
+
+        def _norm_date(value: str) -> str:
+            text = str(value or "").strip()[:10].replace("/", "-")
+            if not text:
+                return ""
+            try:
+                datetime.strptime(text, "%Y-%m-%d")
+            except ValueError:
+                return ""
+            return text
+
+        since_day = _norm_date(since)
+        until_day = _norm_date(until)
+        try:
+            if str(keyword or "").strip():
+                notes = await asyncio.to_thread(
+                    self._db.search_notes, str(keyword).strip(), False, 500
+                )
+            else:
+                notes = await asyncio.to_thread(self._db.list_notes, False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"璃笺检索失败: {exc}")
+            return self._tool_error("璃笺检索失败", exc)
+
+        hits: list[dict[str, Any]] = []
+        needle = str(keyword or "").strip().lower()
+        for note in notes:
+            stamp = str(note.get("diary_date") or note.get("updated_at") or "")[:10]
+            if since_day and stamp and stamp < since_day:
+                continue
+            if until_day and stamp and stamp > until_day:
+                continue
+            hits.append(note)
+            if len(hits) >= limit:
+                break
+
+        def _snippet(body: str) -> str:
+            text = " ".join(str(body or "").split())
+            if not needle:
+                return text[:80] + ("…" if len(text) > 80 else "")
+            pos = text.lower().find(needle)
+            if pos < 0:
+                return text[:80] + ("…" if len(text) > 80 else "")
+            start = max(0, pos - 30)
+            end = min(len(text), pos + len(needle) + 50)
+            piece = text[start:end]
+            return ("…" if start > 0 else "") + piece + ("…" if end < len(text) else "")
+
+        return json.dumps(
+            {
+                "ok": True,
+                "count": len(hits),
+                "range": {"since": since_day or "不限", "until": until_day or "不限"},
+                "notes": [
+                    {
+                        "id": note["id"],
+                        "title": note["title"],
+                        "kind": note["kind"],
+                        "diary_date": note.get("diary_date"),
+                        "tags": note["tags"],
+                        "snippet": _snippet(note.get("body_md", "")),
+                    }
+                    for note in hits
+                ],
+            },
             ensure_ascii=False,
         )
 

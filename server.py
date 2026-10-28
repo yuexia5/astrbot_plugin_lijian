@@ -157,8 +157,27 @@ class BridgeServer:
         app.router.add_route("GET", "/api/v1/events", self._handle_events)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, self.host, self.port)
-        await self._site.start()
+        # 热重载时旧实例的 socket 常常还没落气，头一次 bind 会撞 EADDRINUSE。
+        # 等一会儿再试比直接放弃划算得多——桥接挂了，外部脚本就写不进日记了。
+        last_exc: Optional[BaseException] = None
+        for attempt in range(4):
+            try:
+                self._site = web.TCPSite(self._runner, self.host, self.port)
+                await self._site.start()
+                last_exc = None
+                break
+            except OSError as exc:
+                last_exc = exc
+                self._site = None
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        if last_exc is not None:
+            try:
+                await self._runner.cleanup()
+            except Exception:  # noqa: BLE001
+                pass
+            self._runner = None
+            raise last_exc
         self._watcher_task = asyncio.create_task(self._watch_notes())
 
     async def _shutdown(self) -> None:

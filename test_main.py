@@ -42,11 +42,19 @@ filter_mod = ModuleType("astrbot.api.event.filter")
 
 
 class AstrMessageEvent:
-    def __init__(self, text=""):
+    def __init__(self, text="", private=True, session="sess-1"):
         self.text = text
+        self._private = private
+        self._session = session
 
     def plain_result(self, message):
         return message
+
+    def is_private_chat(self):
+        return self._private
+
+    def get_session_id(self):
+        return self._session
 
 
 class _Filter:
@@ -64,15 +72,38 @@ class _Filter:
 
         return decorate
 
+    def on_llm_request(self, priority=0):
+        def decorate(func):
+            func.__hook__ = "on_llm_request"
+            return func
+
+        return decorate
+
 
 filter_mod.command = _Filter().command
 filter_mod.llm_tool = _Filter().llm_tool
+filter_mod.on_llm_request = _Filter().on_llm_request
 event_mod.filter = filter_mod
 event_mod.AstrMessageEvent = AstrMessageEvent
 api.event = event_mod
 sys.modules["astrbot.api"] = api
 sys.modules["astrbot.api.event"] = event_mod
 sys.modules["astrbot.api.event.filter"] = filter_mod
+
+
+class ProviderRequest:
+    """只保留插件用到的字段。"""
+
+    def __init__(self, session_id="sess-1", system_prompt="", prompt=""):
+        self.session_id = session_id
+        self.system_prompt = system_prompt
+        self.prompt = prompt
+
+
+provider_mod = ModuleType("astrbot.api.provider")
+provider_mod.ProviderRequest = ProviderRequest
+api.provider = provider_mod
+sys.modules["astrbot.api.provider"] = provider_mod
 
 star_mod = ModuleType("astrbot.api.star")
 
@@ -479,6 +510,89 @@ with tempfile.TemporaryDirectory() as tmp:
         check("api export zip", response["_file"].endswith(".zip") and Path(response["_file"]).exists())
 
     asyncio.run(run_tools())
+
+    async def run_recall():
+        # 造一篇日期明确的日记 + 一条便签，验证回卷只翻日记
+        plugin._db.create_note(
+            {
+                "title": "牡丹园",
+                "body_md": "今天去了曹州牡丹园，花开得很好。",
+                "kind": "diary",
+                "diary_date": plugin_main.local_today(),
+                "tags": ["牡丹"],
+                "source": "local",
+            }
+        )
+        plugin._db.create_note(
+            {
+                "title": "一条便签",
+                "body_md": "记得买牛奶。",
+                "kind": "note",
+                "tags": [],
+                "source": "local",
+            }
+        )
+
+        plugin._recalled.clear()
+        event = AstrMessageEvent(private=True, session="sess-private")
+        req = ProviderRequest(session_id="sess-private", system_prompt="你是女仆")
+        await plugin.recall_before_llm(event, req)
+        check("recall injects", "璃笺 · 回卷" in req.system_prompt)
+        check("recall keeps system prompt", "你是女仆" in req.system_prompt)
+        check("recall includes diary", "牡丹园" in req.system_prompt)
+        check("recall excludes note", "买牛奶" not in req.system_prompt)
+
+        # 同一个会话翻过一次就不再塞
+        again = ProviderRequest(session_id="sess-private", system_prompt="你是女仆")
+        await plugin.recall_before_llm(event, again)
+        check("recall not repeated", again.system_prompt == "你是女仆")
+
+        # 群聊默认不翻（日记不该说给一群人听）
+        plugin._recalled.clear()
+        group_req = ProviderRequest(session_id="group-1", system_prompt="")
+        await plugin.recall_before_llm(
+            AstrMessageEvent(private=False, session="group-1"), group_req
+        )
+        check("recall skipped in group", "回卷" not in group_req.system_prompt)
+
+        # 字数上限要真的生效
+        plugin.config["recall_max_chars"] = 300
+        plugin._recalled.clear()
+        small = ProviderRequest(session_id="sess-small")
+        await plugin.recall_before_llm(
+            AstrMessageEvent(private=True, session="sess-small"), small
+        )
+        check("recall respects char cap", len(small.system_prompt) < 900,
+              len(small.system_prompt))
+        plugin.config["recall_max_chars"] = 2400
+
+        # 开关关掉就一句都不加
+        plugin.config["recall_enabled"] = False
+        plugin._recalled.clear()
+        off = ProviderRequest(session_id="sess-off")
+        await plugin.recall_before_llm(
+            AstrMessageEvent(private=True, session="sess-off"), off
+        )
+        check("recall respects switch", off.system_prompt == "")
+        plugin.config["recall_enabled"] = True
+
+        # 预览指令
+        lines = [line async for line in plugin.lijian_recall(AstrMessageEvent())]
+        check("command recall preview", "下次回卷会翻" in lines[0])
+
+        # 检索工具：关键词命中 + 片段
+        result = json.loads(await plugin.search_lijian_notes(None, "牡丹"))
+        check("tool search hits", result["ok"] and result["count"] >= 1)
+        check("tool search snippet", "曹州" in result["notes"][0]["snippet"])
+        check("tool search returns id", bool(result["notes"][0]["id"]))
+
+        # 日期范围能把东西筛掉
+        result = json.loads(
+            await plugin.search_lijian_notes(None, "", since="2000-01-01", until="2000-01-02")
+        )
+        check("tool search date range", result["ok"] and result["count"] == 0)
+
+    asyncio.run(run_recall())
 
     plugin.terminate_sync = None
     asyncio.run(plugin.terminate())
