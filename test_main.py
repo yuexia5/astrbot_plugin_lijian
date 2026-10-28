@@ -629,6 +629,22 @@ with tempfile.TemporaryDirectory() as tmp:
         await plugin.initialize()
         check("auto write job not duplicated", len(ctx.cron_manager.jobs) == 1)
 
+        # 「几点写」支持到分钟：填 20:20，排出来就是 20 点 20 分
+        plugin.config["auto_write_hour"] = "20:20"
+        await plugin.initialize()
+        expression, _ = ctx.cron_manager.handlers[ctx.cron_manager.jobs[0].job_id]
+        check("auto write cron with minute", expression == "20 20 * * *", expression)
+        check("auto write parse hhmm", plugin._auto_write_at() == (20, 20))
+        # 老配置里存的是整数，别因为换了格式就把人家设的点弄丢
+        plugin.config["auto_write_hour"] = 21
+        check("auto write parse legacy int", plugin._auto_write_at() == (21, 0))
+        plugin.config["auto_write_hour"] = "7:5"
+        check("auto write parse short hhmm", plugin._auto_write_at() == (7, 5))
+        plugin.config["auto_write_hour"] = "乱填"
+        check("auto write bad value falls back", plugin._auto_write_at() == (23, 0))
+        plugin.config["auto_write_hour"] = "23:00"
+        await plugin.initialize()
+
         # 素材采集：双方的话都要留下，群里的话一句不留
         plugin._db.material_clear()
         private_event = AstrMessageEvent(text="今天累不累", private=True, session="sess-p")

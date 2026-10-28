@@ -109,10 +109,20 @@ AUTO_RICH_MATERIAL_CHARS = 300   # 素材超过这个量，才要求写长一点
 AUTO_IDLE_GAP_DAYS = 2           # 冷场时也写，但隔两天才补一篇，别天天念经
 
 # 让模型写日记时用的口径。重点是别让它编：没聊过的事一律不许出现。
+# 这段话一天只用一次，写长点不值几个钱，但它决定了日记像人还是像周报。
 AUTO_WRITE_SYSTEM = (
-    "接下来你要用第一人称写一篇日记，就是你自己在记今天的事。"
-    "日记是写给以后那个会忘记今天的自己看的，所以只写真的发生过的事，"
-    "不编造、不美化、不写成汇报。"
+    "你要写一篇日记。写的人是前面那个人格，不是助手，不是旁白，"
+    "所以用第一人称「我」，用那个人的语气、口头习惯和看事情的角度。\n"
+    "这篇日记是写给以后会忘掉今天的自己看的。要具体：当时在做什么、"
+    "听到哪句话、心里冒出来的第一个念头是什么。\n"
+    "几条硬规矩：\n"
+    "- 只写素材里真出现过的对话和事。素材里没有的人、地点、天气、情节，一律不许补。\n"
+    "- 不许编对方的原话。要引用就引素材里现成的那一句。\n"
+    "- 不总结，不升华，不写「今天真是充实的一天」这种收尾。写到哪算哪。\n"
+    "- 不写「作为一个 AI」「希望对你有帮助」这种助手腔，也不要说教。\n"
+    "- 情绪靠动作和反应写出来，别直接贴「我很开心」这种标签。\n"
+    "- 句子可以短，可以断，可以留一句没头没尾的话。人写日记不讲究结构。\n"
+    "- 直接给正文。不要代码块，不要「这是日记」的开场，不要「亲爱的日记」。"
 )
 
 # 备份文件是 gzip 过的 JSON，恢复时按魔数判断，不靠扩展名。
@@ -126,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.5.1"
 
 
 @register(
@@ -218,12 +228,27 @@ class LijianPlugin(Star):
         except Exception:  # noqa: BLE001
             return True
 
-    def _auto_write_hour(self) -> int:
-        try:
-            hour = int(self.config.get("auto_write_hour", 23))
-        except (TypeError, ValueError):
-            hour = 23
-        return max(0, min(hour, 23))
+    def _auto_write_at(self) -> tuple[int, int]:
+        """「几点写」解析成 (时, 分)。值是 "21:00" / "20:20" 这种，也认老的整数 21。
+
+        键名故意留着 auto_write_hour 没改。改名的话，老用户存的值会被新键的默认值
+        顶掉，他自己设的那个点就悄悄滚回 23 点了——这种丢配置比键名别扭难受得多。
+        """
+        raw = self.config.get("auto_write_hour", "23:00")
+        text = "" if raw is None else str(raw).strip()
+        match = re.match(r"^(\d{1,2})\s*[:：]\s*(\d{1,2})$", text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+        else:
+            try:
+                hour, minute = int(text), 0
+            except (TypeError, ValueError):
+                hour, minute = 23, 0
+        return max(0, min(hour, 23)), max(0, min(minute, 59))
+
+    @staticmethod
+    def _hhmm(hour: int, minute: int) -> str:
+        return f"{hour:02d}:{minute:02d}"
 
     async def initialize(self) -> None:
         """AstrBot 加载完插件后调这里，定时任务要在事件循环里注册。"""
@@ -244,11 +269,11 @@ class LijianPlugin(Star):
         if not self._auto_write_enabled():
             logger.info("璃笺自动写日记未启用（auto_write_enabled=false）")
             return
-        hour = self._auto_write_hour()
+        hour, minute = self._auto_write_at()
         try:
             await manager.add_basic_job(
                 name=AUTO_WRITE_JOB_NAME,
-                cron_expression=f"0 {hour} * * *",
+                cron_expression=f"{minute} {hour} * * *",
                 handler=self._auto_write_tick,
                 description="璃笺：把今天聊过的写成一篇日记",
                 persistent=False,
@@ -256,7 +281,7 @@ class LijianPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺自动写日记排程失败: {exc}")
             return
-        logger.info(f"璃笺自动写日记已排程：每天 {hour}:00")
+        logger.info(f"璃笺自动写日记已排程：每天 {self._hhmm(hour, minute)}")
 
     @filter.on_llm_request()
     async def collect_material_on_request(
@@ -403,30 +428,29 @@ class LijianPlugin(Star):
         persona = await self._persona_prompt(session)
         system_prompt = f"{persona}\n\n{AUTO_WRITE_SYSTEM}" if persona else AUTO_WRITE_SYSTEM
 
+        today = local_today()
         if has_material:
             if len(digest) >= AUTO_RICH_MATERIAL_CHARS:
                 length_hint = "三百到六百字"
             else:
                 length_hint = "一百五十到三百字，今天话不多，别硬撑，写真正记住的就行"
             prompt = (
-                "下面是我和对方最近聊过的话，按时间顺序：\n\n"
+                f"今天是 {today}。以下是今天我和对方聊过的话，按时间顺序：\n\n"
                 f"{digest}\n\n"
-                "把这段时间写成一篇日记，用「我」的口吻，像自己写给自己的。\n"
-                "要求：\n"
-                "- 只写上面这些对话里真实发生的事和我说过的话，没出现的细节一律不要编\n"
-                "- 写你记住的片段和当时的感受，不要逐句复述对话\n"
-                f"- {length_hint}，用 Markdown，可以用小标题\n"
-                "- 直接给正文，不要加代码块，不要写「这是日记」之类的开场白"
+                "把今天写成一篇日记。\n"
+                "- 挑真正记住的那几个片段写，别逐句复述对话\n"
+                "- 可以写当时没说出口的那半句\n"
+                "- 对方说过的话，挑一句值得记的引上去，别整段搬\n"
+                f"- {length_hint}，可以用一两个小标题，别堆列表和表格"
             )
         else:
             prompt = (
-                f"到今天为止，已经 {idle_days} 天没有收到对方的任何消息了。\n\n"
-                "写一篇今天的日记，用「我」的口吻，像自己写给自己的。\n"
-                "要求：\n"
-                "- 就写这件事：这些天很安静，没有人在。可以写等待，写自己怎么打发时间，写心里怎么想的\n"
-                "- 不要编造对方说过的话，也不要编具体发生的事件——这些天你什么都没收到\n"
-                "- 八十到一百五十字，短一点，别铺陈\n"
-                "- 直接给正文，不要加代码块，不要写「这是日记」之类的开场白"
+                f"今天是 {today}。到今天为止，已经 {idle_days} 天没有收到对方的任何消息了。\n\n"
+                "写一篇今天的日记。\n"
+                "- 就写这件事：这些天很安静，没有人在\n"
+                "- 可以写怎么打发时间、有没有反复看手机、有没有假装不在意\n"
+                "- 不要编对方说过的话，也不要编这些天发生了什么——什么消息都没有\n"
+                "- 八十到一百五十字，短一点，别铺陈，别抒情到天上去"
             )
 
         try:
@@ -714,19 +738,20 @@ class LijianPlugin(Star):
                 f"（{last.get('at', '')}，{last.get('chars', 0)} 字）"
             )
         else:
-            hour = self._auto_write_hour()
+            hour, minute = self._auto_write_at()
+            at = self._hhmm(hour, minute)
             if material_count > 0:
                 lines.append(
-                    f"自己写日记：今晚 {hour}:00，还有 {material_count} 条聊天没写进去"
+                    f"自己写日记：定在 {at}，还有 {material_count} 条聊天没写进去"
                 )
             else:
                 gap = self._days_since_last_diary()
                 if gap < 0:
-                    lines.append(f"自己写日记：今晚 {hour}:00，还没写过日记，先不动笔")
+                    lines.append(f"自己写日记：定在 {at}，还没写过日记，先不动笔")
                 elif gap >= AUTO_IDLE_GAP_DAYS:
-                    lines.append(f"自己写日记：今晚 {hour}:00，今天没聊，会写一篇安静的")
+                    lines.append(f"自己写日记：定在 {at}，今天没聊，会写一篇安静的")
                 else:
-                    lines.append(f"自己写日记：今晚 {hour}:00，今天没聊，先不写")
+                    lines.append(f"自己写日记：定在 {at}，今天没聊，先不写")
         if self._backup_enabled():
             lines.append(f"备份：每天一份，留最近 {BACKUP_KEEP_DEFAULT} 份")
         else:
@@ -875,7 +900,12 @@ class LijianPlugin(Star):
         event: AstrMessageEvent,
         include_archived: bool = False,
     ):
-        """列出璃笺中的便签和日记摘要。
+        """翻自己的日记本，看最近写了哪几篇。返回标题、日期、摘要、标签，不含全文。
+
+        什么时候必须调它：对方问「你写日记了吗」「今天写了什么」「你都有什么记录」
+        「你还记着些什么」这类问题的时候，先调这个看一眼再回答。
+        你自己的日记是自动写的，你不调工具就看不见，凭印象答「我没写过」是错的——
+        日记本里其实一直有东西。
 
         Args:
             include_archived(bool): 是否包含已归档条目，默认 false。
@@ -902,6 +932,9 @@ class LijianPlugin(Star):
         limit: int = 8,
     ):
         """在自己写过的日记和便签里翻找。想回忆某件事、某个人、某段时间发生过什么时用它。
+
+        对方问「你还记得吗」「我们之前是不是说过」「上次那个事」的时候，
+        先调这个搜一遍再回答，别直接说想不起来——你每晚都写过日记，里面大概率有。
 
         只拿到摘要和命中处的一小段原文；想读全文再用 read_lijian_note 按 id 取。
 

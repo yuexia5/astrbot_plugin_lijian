@@ -7,9 +7,9 @@
   },
   "auto_write_hour": {
     "description": "几点写",
-    "type": "int",
-    "default": 23,
-    "hint": "默认晚上 11 点，0-23。改完重载插件生效。"
+    "type": "string",
+    "default": "23:00",
+    "hint": "24 小时制，写 21:00 或者 20:20 都行，分钟可以自己定。默认 23:00。改完重载插件生效。"
   },
   "default_mode": {
     "description": "AI 写日记时怎么落笔",
