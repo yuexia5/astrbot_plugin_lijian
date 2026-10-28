@@ -1039,11 +1039,23 @@ def normalize_title(title: Any, body: str) -> str:
 
 
 def first_markdown_heading(body: str) -> Optional[str]:
+    # 先找「# 标题」，这一种全文扫：用户可能先写正文再补标题
     for line in body.splitlines():
         stripped = line.strip()
         if stripped.startswith("# "):
             value = stripped[2:].strip()
             if value:
+                return value
+    # 再找整行只有加粗的那种，模型爱这么写小标题（**差点卡住的那颗糖**）
+    # 只看开头几行，并且跳过日记模板里的字段名，免得标题变成「天气」
+    for line in body.splitlines()[:8]:
+        stripped = line.strip()
+        matched = re.match(r"^\*\*(.+?)\*\*[：:]?$", stripped)
+        if not matched:
+            continue
+        value = matched.group(1).strip()
+        if value and value not in ("天气", "心情", "日期", "天气：", "心情："):
+            if len(value) <= 30:
                 return value
     return None
 

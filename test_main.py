@@ -783,6 +783,21 @@ with tempfile.TemporaryDirectory() as tmp:
             plugin._strip_code_fence("```markdown\n正文\n```") == "正文",
         )
 
+        # 标签行拆分：三种写法都要认，且正文里不能留下那一行
+        body, tags = plugin._split_ai_tags("**标题**\n\n正文一段。\n\n标签：糖、撒娇、晚安")
+        check("split tags plain", (body, tags) == ("**标题**\n\n正文一段。", ["糖", "撒娇", "晚安"]))
+        body, tags = plugin._split_ai_tags("正文。\n\n**标签**：加班，雨夜")
+        check("split tags bold", tags == ["加班", "雨夜"] and body == "正文。")
+        body, tags = plugin._split_ai_tags("正文。\n\n标签: 糖、撒娇")
+        check("split tags half colon", tags == ["糖", "撒娇"])
+        check("split tags none", plugin._split_ai_tags("正文，没有标签行。") == ("正文，没有标签行。", []))
+        body, tags = plugin._split_ai_tags("正文。\n\n标签：")
+        check("split tags empty drops line", body == "正文。" and tags == [])
+        check(
+            "split tags keeps inline word",
+            plugin._split_ai_tags("正文里说到标签：这个词")[1] == [],
+        )
+
     asyncio.run(run_auto_write())
 
     plugin.terminate_sync = None

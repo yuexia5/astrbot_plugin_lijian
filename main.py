@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.2"
 
 
 @register(
@@ -334,6 +334,37 @@ class LijianPlugin(Star):
             lines = lines[:-1]
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _split_ai_tags(text: str) -> tuple[str, list[str]]:
+        """把正文末尾那行「标签：a、b」拆出来，正文里不留这一行。
+
+        只从最后几行里找，找不到就原样返回——标签是锦上添花，
+        不该因为模型少写一行就把整篇日记判成不合格。
+        """
+        body = str(text or "").strip()
+        if not body:
+            return "", []
+        lines = body.splitlines()
+        start = max(len(lines) - 4, 0)
+        for idx in range(len(lines) - 1, start - 1, -1):
+            matched = re.match(
+                r"^\s*[-*]?\s*\**\s*(?:标签|tags?)\s*\**\s*[：:]\s*(.*?)\s*$",
+                lines[idx],
+                re.IGNORECASE,
+            )
+            if not matched:
+                continue
+            tags = []
+            for tag in clean_tags(matched.group(1)):
+                piece = tag.strip().strip("。.、，,")
+                if piece and piece not in tags:
+                    tags.append(piece[:10])
+                if len(tags) >= 3:
+                    break
+            rest = "\n".join(lines[:idx] + lines[idx + 1 :]).rstrip()
+            return rest, tags
+        return body, []
+
     def _auto_write_done_today(self) -> bool:
         try:
             last = self._db.state_get("auto_write", {}) or {}
@@ -358,6 +389,42 @@ class LijianPlugin(Star):
         if not isinstance(persona, dict):
             return ""
         return str(persona.get("prompt") or "").strip()
+
+    @staticmethod
+    def _provider_name(prov) -> str:
+        cfg = getattr(prov, "provider_config", None) or {}
+        if isinstance(cfg, dict):
+            return str(cfg.get("id") or cfg.get("type") or "")
+        return type(prov).__name__
+
+    def _diary_provider(self, umo: str = ""):
+        """写日记用哪个模型：配置里选了就用选的，没选就跟着会话的主模型走。
+
+        「主 LLM Provider」不是全局那一格。AstrBot 允许给不同会话绑不同的配置文件
+        （这台机器上就有一份叫「粟茗」的，里面设了 deepseek），解析的时候要看 umo。
+        不带 umo 只会读到默认那份，默认那份空着时还会退到提供商列表第一个，
+        那个位置常常躺着一个早就下线的模型。
+
+        所以这里把素材里那个会话的 umo 带进去，读到的才是主人真正在用的那个。
+        """
+        want = str(self.config.get("auto_write_provider_id", "") or "").strip()
+        if want:
+            try:
+                for prov in self.context.get_all_providers():
+                    if self._provider_name(prov) == want:
+                        return prov
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"璃笺查找指定模型失败: {exc}")
+            logger.warning(f"璃笺：配置里指定的模型 {want} 找不到，改用主 LLM Provider")
+        for arg in ([umo, None] if umo else [None]):
+            try:
+                prov = self.context.get_using_provider(arg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"璃笺取主 LLM Provider 失败: {exc}")
+                continue
+            if prov is not None:
+                return prov
+        return None
 
     def _days_since_last_diary(self) -> int:
         """距上一篇日记几天。一篇都没写过（或者读不出来）返回 -1。"""
@@ -410,13 +477,6 @@ class LijianPlugin(Star):
                 logger.info("璃笺自动写日记：一篇日记都还没有，今晚不凭空开篇")
                 return
 
-        try:
-            provider = self.context.get_using_provider()
-        except Exception:  # noqa: BLE001
-            provider = None
-        if provider is None:
-            logger.warning("璃笺自动写日记：没有可用的模型提供商，跳过")
-            return
         # 用哪个会话的 umo 取人格：素材里最后说话的那个；没素材就用默认人格。
         session = ""
         try:
@@ -429,6 +489,12 @@ class LijianPlugin(Star):
         system_prompt = f"{persona}\n\n{AUTO_WRITE_SYSTEM}" if persona else AUTO_WRITE_SYSTEM
 
         today = local_today()
+        # 标签让模型自己给：它知道今天这篇写了什么，写死一个「日记」等于没打。
+        tag_hint = (
+            "\n- 正文最后另起一行写「标签：a、b、c」，两到三个词，"
+            "写这篇里真的出现过的东西或心情，具体一点（糖、加班、雨夜），"
+            "别写「日记」「日常」这种空泛词"
+        )
         if has_material:
             if len(digest) >= AUTO_RICH_MATERIAL_CHARS:
                 length_hint = "三百到六百字"
@@ -442,6 +508,7 @@ class LijianPlugin(Star):
                 "- 可以写当时没说出口的那半句\n"
                 "- 对方说过的话，挑一句值得记的引上去，别整段搬\n"
                 f"- {length_hint}，可以用一两个小标题，别堆列表和表格"
+                f"{tag_hint}"
             )
         else:
             prompt = (
@@ -451,19 +518,31 @@ class LijianPlugin(Star):
                 "- 可以写怎么打发时间、有没有反复看手机、有没有假装不在意\n"
                 "- 不要编对方说过的话，也不要编这些天发生了什么——什么消息都没有\n"
                 "- 八十到一百五十字，短一点，别铺陈，别抒情到天上去"
+                f"{tag_hint}"
             )
 
+        provider = self._diary_provider(session)
+        if provider is None:
+            logger.warning("璃笺自动写日记：没有可用的模型提供商，跳过")
+            return
+        provider_name = self._provider_name(provider)
         try:
             response = await provider.text_chat(
                 prompt=prompt, system_prompt=system_prompt
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"璃笺自动写日记调用模型失败: {exc}")
+            logger.warning(
+                f"璃笺自动写日记调用模型失败（{provider_name}）: {exc}"
+                "；素材游标没动，在璃笺配置里换个模型重跑还能补上"
+            )
             return
         body = self._strip_code_fence(getattr(response, "completion_text", ""))
+        body, ai_tags = self._split_ai_tags(body)
         if not body:
             logger.warning("璃笺自动写日记：模型返回了空正文，游标不动，下次再试")
             return
+        if not ai_tags:
+            ai_tags = ["日记"]
         try:
             note = await asyncio.to_thread(
                 self._db.write_diary_from_ai,
@@ -471,7 +550,7 @@ class LijianPlugin(Star):
                     "content_md": body,
                     "title": None,
                     "diary_date": None,
-                    "tags": ["日记", "自动"],
+                    "tags": ai_tags,
                     "mode": "append_today",
                 },
             )

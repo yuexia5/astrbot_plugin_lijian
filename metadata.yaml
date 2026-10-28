@@ -2,7 +2,7 @@ name: astrbot_plugin_lijian
 display_name: 璃笺
 desc: 运行在 AstrBot 内的日记本：每天到点自己写一篇，用你设的人格口吻；有书架页面，日记是一本本书的书脊，抽出来翻开就能读和改。只管写日记，不抢记忆插件的活。
 short_desc: 会自己写日记的日记本，书架能像翻书一样读和改。
-version: v1.5.1
+version: v1.5.2
 author: baiwei
 repo: https://github.com/yuexia5/astrbot_plugin_lijian
 astrbot_version: ">=4.16.0"
