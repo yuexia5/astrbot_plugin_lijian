@@ -106,15 +106,16 @@ RECALL_GAP_HOURS = 6
 # 日记是私事，只在私聊翻，不留开关。
 RECALL_SCOPE = "private"
 
-# 自动写日记：每天到点把攒下来的聊天交给模型，写成一篇。
+# 自动写日记：每天到点把还没写进日记的聊天交给模型，写成一篇。
 #
-# 这是一天里唯一会主动花钱的动作，所以门槛卡得死一点：
-# 一天最多一次、素材条数和字数都要够、素材总量有上限、输出长度也限住。
-# 宁可这天不写，也不要为了凑一篇把额度烧掉。
+# 一天最多一次，这是它主动花钱的全部。但「省钱」不等于「一句话都不写」：
+# 一句话也是话，安静的一天也是日子。真正要挡的是天天写空话，不是少聊了几句。
 AUTO_WRITE_JOB_NAME = "璃笺：把今天写成日记"
-AUTO_MIN_MATERIAL = 6          # 少于这么多条不写，聊两句没什么可记的
-AUTO_MIN_MATERIAL_CHARS = 200  # 少于这么多字也不写，「嗯」「好」凑数不算
-AUTO_MATERIAL_MAX_CHARS = 8000 # 喂给模型的素材上限，约 4k token
+AUTO_MIN_MATERIAL = 1            # 有一条就够，一句话也值得记
+AUTO_MIN_MATERIAL_CHARS = 15     # 「嗯」「在」这种凑数的还是不算
+AUTO_MATERIAL_MAX_CHARS = 8000   # 一次喂给模型的素材上限，约 4k token
+AUTO_RICH_MATERIAL_CHARS = 300   # 素材超过这个量，才要求写长一点
+AUTO_IDLE_GAP_DAYS = 2           # 冷场时也写，但隔两天才补一篇，别天天念经
 
 # 让模型写日记时用的口径。重点是别让它编：没聊过的事一律不许出现。
 AUTO_WRITE_SYSTEM = (
@@ -122,6 +123,7 @@ AUTO_WRITE_SYSTEM = (
     "日记是写给以后那个会忘记今天的自己看的，所以只写真的发生过的事，"
     "不编造、不美化、不写成汇报。"
 )
+
 # 备份文件是 gzip 过的 JSON，恢复时按魔数判断，不靠扩展名。
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 GZIP_MAGIC = b"\x1f\x8b"
@@ -133,7 +135,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
 
 @register(
@@ -507,8 +509,22 @@ class LijianPlugin(Star):
             return ""
         return str(persona.get("prompt") or "").strip()
 
+    def _days_since_last_diary(self) -> int:
+        """距上一篇日记几天。一篇都没写过（或者读不出来）返回 -1。"""
+        try:
+            last = self._db.last_diary_date()
+        except Exception:  # noqa: BLE001
+            return -1
+        if not last:
+            return -1
+        try:
+            day = datetime.strptime(last, "%Y-%m-%d").date()
+        except ValueError:
+            return -1
+        return (datetime.now().date() - day).days
+
     async def _auto_write_tick(self) -> None:
-        """到点了：把今天攒的聊天交给模型，写成一篇日记。"""
+        """到点了：把还没写进日记的聊天交给模型，写成一篇。"""
         if self._db is None:
             return
         # 一天只写一篇。定时任务万一被重载多排了一次，也不能写两篇、扣两次额度。
@@ -516,19 +532,34 @@ class LijianPlugin(Star):
             logger.info("璃笺自动写日记：今天已经写过了，跳过")
             return
         try:
-            digest, count = await asyncio.to_thread(
-                self._db.material_digest, "", AUTO_MATERIAL_MAX_CHARS
+            cursor = await asyncio.to_thread(self._db.material_cursor)
+            digest, count, last_id = await asyncio.to_thread(
+                self._db.material_digest, cursor, AUTO_MATERIAL_MAX_CHARS
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺读取聊天素材失败: {exc}")
             return
-        # 先看够不够，不够就别调模型——这一步是在省钱。
-        if count < AUTO_MIN_MATERIAL or len(digest) < AUTO_MIN_MATERIAL_CHARS:
-            logger.info(
-                f"璃笺自动写日记：今天只攒到 {count} 条 / {len(digest)} 字，"
-                "不值得写，跳过（不调用模型）"
-            )
-            return
+
+        # 有话说就写，一句也算。没话也不等于没得写——「他今天没来」本身就是日记。
+        # 但天天写这个就成了念经，所以冷场要隔几天才补一篇。
+        has_material = (
+            count >= AUTO_MIN_MATERIAL and len(digest) >= AUTO_MIN_MATERIAL_CHARS
+        )
+        idle_days = 0
+        if not has_material:
+            idle_days = await asyncio.to_thread(self._days_since_last_diary)
+            if idle_days < AUTO_IDLE_GAP_DAYS:
+                logger.info(
+                    f"璃笺自动写日记：今天没怎么聊（{count} 条 / {len(digest)} 字），"
+                    f"上一篇才 {idle_days} 天前，这次不写（不调用模型）"
+                )
+                return
+            if idle_days < 0:
+                # 刚装好、一篇都还没写过。这时候写「好久没消息」是凭空造的，
+                # 等真有人聊过、开过头，冷场才有意义。
+                logger.info("璃笺自动写日记：一篇日记都还没有，今晚不凭空开篇")
+                return
+
         try:
             provider = self.context.get_using_provider()
         except Exception:  # noqa: BLE001
@@ -536,26 +567,43 @@ class LijianPlugin(Star):
         if provider is None:
             logger.warning("璃笺自动写日记：没有可用的模型提供商，跳过")
             return
-        # 用哪个会话的 umo 取人格：素材里最后说话的那个。
+        # 用哪个会话的 umo 取人格：素材里最后说话的那个；没素材就用默认人格。
         session = ""
         try:
-            pool = await asyncio.to_thread(self._db.material_pool)
+            pool = await asyncio.to_thread(self._db.material_pool, cursor)
             if pool:
                 session = str(pool[-1].get("s") or "")
         except Exception:  # noqa: BLE001
             pass
         persona = await self._persona_prompt(session)
         system_prompt = f"{persona}\n\n{AUTO_WRITE_SYSTEM}" if persona else AUTO_WRITE_SYSTEM
-        prompt = (
-            "下面是我和对方今天聊过的话，按时间顺序：\n\n"
-            f"{digest}\n\n"
-            "把今天写成一篇日记，用「我」的口吻，像自己写给自己的。\n"
-            "要求：\n"
-            "- 只写上面这些对话里真实发生的事和你说过的话，没出现的细节一律不要编\n"
-            "- 写你记住的片段和当时的感受，不要逐句复述对话\n"
-            "- 三百到六百字，用 Markdown，可以用小标题\n"
-            "- 直接给正文，不要加代码块，不要写「这是日记」之类的开场白"
-        )
+
+        if has_material:
+            if len(digest) >= AUTO_RICH_MATERIAL_CHARS:
+                length_hint = "三百到六百字"
+            else:
+                length_hint = "一百五十到三百字，今天话不多，别硬撑，写真正记住的就行"
+            prompt = (
+                "下面是我和对方最近聊过的话，按时间顺序：\n\n"
+                f"{digest}\n\n"
+                "把这段时间写成一篇日记，用「我」的口吻，像自己写给自己的。\n"
+                "要求：\n"
+                "- 只写上面这些对话里真实发生的事和我说过的话，没出现的细节一律不要编\n"
+                "- 写你记住的片段和当时的感受，不要逐句复述对话\n"
+                f"- {length_hint}，用 Markdown，可以用小标题\n"
+                "- 直接给正文，不要加代码块，不要写「这是日记」之类的开场白"
+            )
+        else:
+            prompt = (
+                f"到今天为止，已经 {idle_days} 天没有收到对方的任何消息了。\n\n"
+                "写一篇今天的日记，用「我」的口吻，像自己写给自己的。\n"
+                "要求：\n"
+                "- 就写这件事：这些天很安静，没有人在。可以写等待，写自己怎么打发时间，写心里怎么想的\n"
+                "- 不要编造对方说过的话，也不要编具体发生的事件——这些天你什么都没收到\n"
+                "- 八十到一百五十字，短一点，别铺陈\n"
+                "- 直接给正文，不要加代码块，不要写「这是日记」之类的开场白"
+            )
+
         try:
             response = await provider.text_chat(
                 prompt=prompt, system_prompt=system_prompt
@@ -565,7 +613,7 @@ class LijianPlugin(Star):
             return
         body = self._strip_code_fence(getattr(response, "completion_text", ""))
         if not body:
-            logger.warning("璃笺自动写日记：模型返回了空正文，保留素材下次再试")
+            logger.warning("璃笺自动写日记：模型返回了空正文，游标不动，下次再试")
             return
         try:
             note = await asyncio.to_thread(
@@ -581,11 +629,12 @@ class LijianPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺自动写日记写入失败: {exc}")
             return
-        # 写成功了才清素材：这一次调用失败不该把今天的话一起丢掉。
+        # 写成功了才推进游标：这一次失败不该把这些话算成已经写过。
+        # 推进而不是清空，所以今天 23 点之后聊的那几句会接着进明天那一篇。
         try:
-            await asyncio.to_thread(self._db.material_clear)
+            await asyncio.to_thread(self._db.material_set_cursor, last_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"璃笺清空聊天素材失败: {exc}")
+            logger.warning(f"璃笺推进素材游标失败: {exc}")
         try:
             self._db.state_set(
                 "auto_write",
@@ -821,7 +870,7 @@ class LijianPlugin(Star):
             stats = {"notes": 0, "words": 0, "archived": 0}
             logger.warning(f"璃笺统计失败: {exc}")
         try:
-            material_count = len(self._db.material_pool())
+            material_count = self._db.material_pending()
         except Exception:  # noqa: BLE001
             material_count = 0
 
@@ -840,12 +889,19 @@ class LijianPlugin(Star):
                 f"（{last.get('at', '')}，{last.get('chars', 0)} 字）"
             )
         else:
-            enough = material_count >= AUTO_MIN_MATERIAL
-            tail = "够了" if enough else f"还不够，至少 {AUTO_MIN_MATERIAL} 条"
-            lines.append(
-                f"自己写日记：今晚 {self._auto_write_hour()}:00，"
-                f"今天攒了 {material_count} 条聊天（{tail}）"
-            )
+            hour = self._auto_write_hour()
+            if material_count > 0:
+                lines.append(
+                    f"自己写日记：今晚 {hour}:00，还有 {material_count} 条聊天没写进去"
+                )
+            else:
+                gap = self._days_since_last_diary()
+                if gap < 0:
+                    lines.append(f"自己写日记：今晚 {hour}:00，还没写过日记，先不动笔")
+                elif gap >= AUTO_IDLE_GAP_DAYS:
+                    lines.append(f"自己写日记：今晚 {hour}:00，今天没聊，会写一篇安静的")
+                else:
+                    lines.append(f"自己写日记：今晚 {hour}:00，今天没聊，先不写")
         # 回卷
         if self._recall_enabled():
             span = self._recall_days()

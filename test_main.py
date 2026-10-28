@@ -2,6 +2,7 @@
 import asyncio
 import gzip
 import json
+from datetime import datetime, timedelta
 import socket
 import sys
 import tempfile
@@ -749,13 +750,23 @@ with tempfile.TemporaryDirectory() as tmp:
         await plugin.collect_material_on_request(group_event, ProviderRequest())
         check("material skipped in group", len(plugin._db.material_pool()) == 2)
 
-        # 没素材时一个 token 都不该花
+        # 今天刚写过、现在也没话：一个 token 都不该花
         provider = FakeProvider("不该被调用")
         ctx.provider = provider
         plugin._db.material_clear()
         plugin._db.state_set("auto_write", {})
+        plugin._db.write_diary_from_ai(
+            {
+                "content_md": "刚才已经写过一篇了。",
+                "title": "刚写过",
+                "diary_date": None,
+                "tags": [],
+                "mode": "create",
+            }
+        )
         await plugin._auto_write_tick()
-        check("auto write skips when empty", provider.calls == [])
+        check("auto write skips when quiet", provider.calls == [])
+        check("auto write skip is cheap", plugin._db.material_pending() == 0)
 
         # 素材够了才写，并且要用设好的人格口吻
         for index in range(8):
@@ -778,7 +789,13 @@ with tempfile.TemporaryDirectory() as tmp:
             "auto write feeds material",
             "第0条聊天内容" in str(provider.calls[0]["prompt"]),
         )
-        check("auto write clears material", len(plugin._db.material_pool()) == 0)
+        check("auto write consumes material", plugin._db.material_pending() == 0)
+        check("auto write keeps rows for audit", len(plugin._db.material_pool()) == 8)
+        # 游标之后的才算没写过：补一句新的，只该数这一条
+        plugin._db.material_append(
+            "test:FriendMessage:sess-p", "user", "写完之后又聊了一句。"
+        )
+        check("cursor only counts newer", plugin._db.material_pending() == 1)
         check("auto write marks today", plugin._auto_write_done_today())
         wrote = plugin._db.search_notes("聊了很久")
         check("auto write saved note", len(wrote) >= 1)
@@ -792,6 +809,53 @@ with tempfile.TemporaryDirectory() as tmp:
         )
         await plugin._auto_write_tick()
         check("auto write once per day", provider.calls == [])
+
+        # 一句话也值得写：门槛不该卡在条数上
+        plugin._db.material_clear()
+        plugin._db.state_set("auto_write", {})
+        plugin._db.material_append(
+            "test:FriendMessage:sess-p", "user", "今天下雨，忘了带伞，回来鞋全湿了。"
+        )
+        provider = FakeProvider("就这一句，也记一下。")
+        ctx.provider = provider
+        await plugin._auto_write_tick()
+        check(
+            "auto write accepts single line",
+            len(provider.calls) == 1,
+            len(provider.calls),
+        )
+
+        # 冷场也能写：好几天没聊，写一篇安静的，但不许编
+        plugin._db.material_clear()
+        plugin._db.state_set("auto_write", {})
+        old_day = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        # 把前面几篇的日期整体挪到三天前，造出「冷场三天」这个场景
+        plugin._db.conn.execute(
+            "UPDATE notes SET diary_date = ? WHERE kind = 'diary'", (old_day,)
+        )
+        plugin._db.conn.commit()
+        provider = FakeProvider("这几天没人说话，屋里安静得能听见钟走。")
+        ctx.provider = provider
+        await plugin._auto_write_tick()
+        check(
+            "auto write fills quiet days",
+            len(provider.calls) == 1,
+            len(provider.calls),
+        )
+        check(
+            "quiet prompt forbids inventing",
+            "没有收到对方" in str(provider.calls[0]["prompt"]),
+        )
+
+        # 一篇都还没写过：不凭空开篇，「好久没消息」得先有消息可对比
+        plugin._db.material_clear()
+        plugin._db.state_set("auto_write", {})
+        plugin._db.conn.execute("DELETE FROM notes")
+        plugin._db.conn.commit()
+        provider = FakeProvider("不该被调用")
+        ctx.provider = provider
+        await plugin._auto_write_tick()
+        check("auto write does not invent first entry", provider.calls == [])
 
         # 关掉开关就不排程
         plugin.config["auto_write_enabled"] = False

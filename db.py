@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS write_events (
     FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
 );
 
--- 自动写日记的素材池。每轮聊天追加一行，到点拿去让模型写，写完清掉。
+-- 自动写日记的素材池。每轮聊天追加一行，到点拿去让模型写，写完往前推游标。
 -- 单独建表而不是塞进 settings：一天几百轮对话，每次整份 JSON 读改写会很拖。
 CREATE TABLE IF NOT EXISTS diary_materials (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,6 +224,21 @@ class Database:
             return self.settings()
 
     # ---------- 便签 / 日记 ----------
+
+    def last_diary_date(self) -> str:
+        """最近一篇日记写在哪天（YYYY-MM-DD）。没写过返回空串。
+
+        只取一个日期，不走全表，自动写日记每次到点都要问一遍。
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT diary_date FROM notes WHERE kind = 'diary' "
+                "AND diary_date IS NOT NULL AND diary_date != '' "
+                "ORDER BY diary_date DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return ""
+        return str(row["diary_date"] or "")[:10]
 
     def list_notes(self, include_archived: bool = False, light: bool = False) -> list[dict[str, Any]]:
         """列出条目。light=True 时不带 body_md，书架首屏省带宽。"""
@@ -796,10 +811,14 @@ class Database:
     # 日记要有人写，可 AI 到点就忘了今天聊过什么。所以在每轮聊天时顺手把
     # 双方的话攒一点下来，到点一次性交给模型去写。
     # 单独一张表，只做插入和按序取：聊得再多也不会因为整份读写而拖慢聊天。
+    #
+    # 游标（material:cursor）记着「上次写日记时看到第几条」。写日记只取游标之后的，
+    # 所以昨天 23 点之后聊的那几句，会接着出现在明天那篇里，不会被嚼两遍也不会漏。
 
     # 攒太多没意义：一天聊上千句是刷屏不是生活，留最近这些够了。
-    MATERIAL_MAX_ITEMS = 400
+    MATERIAL_MAX_ITEMS = 600
     MATERIAL_ITEM_CHARS = 600
+    CURSOR_KEY = "material_cursor"
 
     def material_append(self, session: str, role: str, content: str) -> bool:
         """记一条素材。返回是否真的记下了（空的、跟上一条重复的会丢掉）。"""
@@ -829,18 +848,37 @@ class Database:
             self._persist()
         return True
 
-    def material_pool(self, since: str = "") -> list[dict[str, Any]]:
-        """按时间正序取素材。字段名保持 t/s/r/c，调用方不用关心表结构。"""
-        sql = "SELECT session, role, content, created_at FROM diary_materials"
+    def material_cursor(self) -> int:
+        """上次写日记时看到第几条素材。0 表示还没写过。"""
+        try:
+            value = self.state_get(self.CURSOR_KEY, 0)
+            return int(value or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def material_set_cursor(self, value: int) -> None:
+        """把游标推到这条。只往前推，不会被一次异常回退。"""
+        try:
+            current = self.material_cursor()
+            if int(value) <= current:
+                return
+            self.state_set(self.CURSOR_KEY, int(value))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def material_pool(self, after_id: int = 0) -> list[dict[str, Any]]:
+        """按时间正序取还没写进日记的素材。字段名保持 t/s/r/c，另带 id。"""
+        sql = "SELECT id, session, role, content, created_at FROM diary_materials"
         params: tuple[Any, ...] = ()
-        if since:
-            sql += " WHERE created_at >= ?"
-            params = (since,)
+        if after_id:
+            sql += " WHERE id > ?"
+            params = (int(after_id),)
         sql += " ORDER BY id ASC"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
         return [
             {
+                "id": row["id"],
                 "t": row["created_at"],
                 "s": row["session"],
                 "r": row["role"],
@@ -849,25 +887,39 @@ class Database:
             for row in rows
         ]
 
+    def material_pending(self) -> int:
+        """还有多少条没被写进日记。状态指令用它报数。"""
+        cursor = self.material_cursor()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM diary_materials WHERE id > ?", (cursor,)
+            ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def material_digest(
-        self, since: str = "", max_chars: int = 8000
-    ) -> tuple[str, int]:
-        """把素材拼成一段对话记录，超预算从最旧的砍。返回 (文本, 条数)。"""
-        pool = self.material_pool(since)
+        self, after_id: int = 0, max_chars: int = 8000
+    ) -> tuple[str, int, int]:
+        """把没写进日记的素材拼成对话记录。
+
+        返回 (文本, 条数, 消费到的 id)。从最早一条往后装，装满就停——
+        一次塞不完的下次接着塞，不会为了照顾最新的而漏掉中间那段。
+        """
+        pool = self.material_pool(after_id)
         lines: list[str] = []
         used = 0
-        for item in reversed(pool):
+        last_id = int(after_id)
+        for item in pool:
             who = "对方" if item.get("r") == "user" else "我"
             line = f"{who}：{item.get('c', '')}"
             if lines and used + len(line) > max_chars:
                 break
             lines.append(line)
             used += len(line)
-        lines.reverse()
-        return "\n".join(lines), len(lines)
+            last_id = int(item.get("id") or last_id)
+        return "\n".join(lines), len(lines), last_id
 
     def material_clear(self) -> int:
-        """写完日记就把素材清掉，免得下一篇又嚼一遍旧料。"""
+        """清空素材并把游标归零。只在手动清理时用，自动写日记走游标。"""
         with self._lock:
             row = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM diary_materials"
@@ -875,6 +927,10 @@ class Database:
             count = int(row["n"]) if row is not None else 0
             self.conn.execute("DELETE FROM diary_materials")
             self._persist()
+        try:
+            self.state_set(self.CURSOR_KEY, 0)
+        except Exception:  # noqa: BLE001
+            pass
         return count
 
     def _get_setting(self, key: str) -> Optional[str]:

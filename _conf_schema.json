@@ -3,7 +3,7 @@
     "description": "每天自己写日记",
     "type": "bool",
     "default": true,
-    "hint": "到点把今天聊过的话写成一篇日记，不用你开口。当天没聊够就不写，不会瞎编。"
+    "hint": "到点把今天聊过的话写成一篇日记，不用你开口。聊了一句也写；好几天没聊天，会隔两天补一篇安静的。不会瞎编。"
   },
   "auto_write_hour": {
     "description": "几点写",
@@ -27,8 +27,14 @@
     "description": "AI 写日记时怎么落笔",
     "type": "string",
     "default": "append_today",
-    "options": ["append_today", "create"],
-    "labels": ["接到今天那篇后面", "另起一篇新的"],
+    "options": [
+      "append_today",
+      "create"
+    ],
+    "labels": [
+      "接到今天那篇后面",
+      "另起一篇新的"
+    ],
     "hint": "默认接到今天那篇后面，一天一篇，不会碎成一地。"
   },
   "diary_template": {
