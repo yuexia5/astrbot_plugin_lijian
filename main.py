@@ -275,7 +275,11 @@ class LijianPlugin(Star):
                 name=AUTO_WRITE_JOB_NAME,
                 cron_expression=f"{minute} {hour} * * *",
                 handler=self._auto_write_tick,
-                description="璃笺：把今天聊过的写成一篇日记",
+                description=(
+                    "把今天私聊里聊过、还没写进日记的话交给模型，按当前人格的口吻写成一篇。"
+                    "今天已经写过就跳过；今天没怎么聊、距上一篇还不到两天也跳过，"
+                    "这两种情况都不调模型；冷场久了补一篇安静的。"
+                ),
                 persistent=False,
             )
         except Exception as exc:  # noqa: BLE001
