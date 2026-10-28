@@ -13,8 +13,8 @@
   让 AI 写日记、翻旧事、归档、取周报素材。
 - **回卷**：新上下文（重载插件、换会话、隔了几小时再聊）里，AI 开口之前会先把最近几天的日记
   翻一遍再说话，不用你重新交代「我们上次说到哪」。只在私聊里翻，群聊不碰。
-- **指令**：`/lijian_status` `/lijian_write` `/lijian_list` `/lijian_read` `/lijian_delete`
-  `/lijian_recall`。
+- **指令**（中文名，英文留作别名）：`/日记状态` `/写日记` `/日记列表` `/读日记` `/删日记`
+  `/回卷`，对应 `lijian_status` `lijian_write` `lijian_list` `lijian_read` `lijian_delete` `lijian_recall`。
 - **本地写入接口**：默认监听 `127.0.0.1:27176`，提供与 AI 桥相同的
   `POST /api/v1/diary` 等 HTTP 接口，外部脚本 / 自动任务可以直接调。
 - **书架页面**：AstrBot WebUI 插件详情页里的「璃笺书架」——日记是书架上的一本本书，
@@ -184,8 +184,9 @@ AI 想主动回忆某件事时，可以用 `search_lijian_notes` 按关键词和
   不再一重载就失忆。同一会话只翻一次，隔 `recall_gap_hours` 小时才重翻，字数有硬上限。
 - 新：`search_lijian_notes` 工具。AI 能按关键词 + 日期范围主动翻旧事，
   返回摘要和命中处上下文片段，比 `list_lijian_notes` 更适合「想起某件事」。
-- 新：`/lijian_recall` 指令，预览下次会翻哪几篇。
+- 新：`/回卷` 指令，预览下次会翻哪几篇。
 - 新：`recall_*` 六项配置，可关、可调天数篇数字数、可决定群聊要不要翻。
+- 改：指令名全部换成中文，不用记英文缩写；英文名保留为别名，老用法照样能用。
 - 修：本地接口热重载时端口常被上一个实例占住，`bind` 一次失败就放弃。
   现在退避重试 4 次，重载不再随机丢掉桥接。
 - 修：`test_smoke.py` 里 streak 断言跟着写死的日期一起腐化，改成与 `diary_streak()` 对齐。

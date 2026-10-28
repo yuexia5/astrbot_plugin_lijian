@@ -58,9 +58,10 @@ class AstrMessageEvent:
 
 
 class _Filter:
-    def command(self, name):
+    def command(self, name, alias=None, sub_command=None, **kwargs):
         def decorate(func):
             func.__command__ = name
+            func.__alias__ = set(alias or set())
             return func
 
         return decorate
@@ -243,6 +244,24 @@ with tempfile.TemporaryDirectory() as tmp:
     ctx = Context()
     plugin = plugin_main.LijianPlugin(ctx, config)
     check("plugin registered", plugin_main.LijianPlugin.__registered__[0] == "astrbot_plugin_lijian")
+
+    # 指令名要说人话，英文留作别名，老用法不断
+    command_names = set()
+    command_aliases = set()
+    for member in vars(plugin_main.LijianPlugin).values():
+        if hasattr(member, "__command__"):
+            command_names.add(member.__command__)
+        command_aliases |= getattr(member, "__alias__", set())
+    check(
+        "commands are chinese",
+        {"日记状态", "写日记", "日记列表", "读日记", "删日记", "回卷"} <= command_names,
+        command_names,
+    )
+    check(
+        "commands keep english alias",
+        {"lijian_status", "lijian_write", "lijian_recall"} <= command_aliases,
+        command_aliases,
+    )
     check(
         "db opened",
         Path(tmp, "lijian.sqlite3").exists() and plugin._db is not None,
@@ -591,6 +610,25 @@ with tempfile.TemporaryDirectory() as tmp:
             await plugin.search_lijian_notes(None, "", since="2000-01-01", until="2000-01-02")
         )
         check("tool search date range", result["ok"] and result["count"] == 0)
+
+        # 窗口内一篇都没有时，退一步拿最近写过的——不能因为好久没动笔就彻底失忆
+        keep = plugin._db
+        plugin._db = plugin_main.Database(memory=True)
+        try:
+            plugin._db.create_note(
+                {
+                    "title": "很久以前",
+                    "body_md": "老掉牙的一篇",
+                    "kind": "diary",
+                    "diary_date": "2020-01-01",
+                }
+            )
+            fallback = plugin._recall_candidates()
+            check("recall falls back outside window",
+                  len(fallback) == 1 and fallback[0]["title"] == "很久以前")
+        finally:
+            plugin._db.close()
+            plugin._db = keep
 
     asyncio.run(run_recall())
 

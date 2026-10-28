@@ -1,7 +1,7 @@
 """璃笺 AstrBot 插件：无头环境下的日记与便签书库。
 
 把桌面版璃笺（Tauri）的存储与写入接口移植进 AstrBot：
-- 指令：/lijian_status /lijian_write /lijian_list /lijian_read /lijian_delete /lijian_recall
+- 指令：/日记状态 /写日记 /日记列表 /读日记 /删日记 /回卷（英文名作别名保留）
 - LLM 工具：write_lijian_diary / list_lijian_notes / search_lijian_notes / read_lijian_note /
   update_lijian_note / delete_lijian_note / lijian_weekly
 - 回卷：开新上下文时自动把最近几天的日记翻给 AI 看，让它接着上次的记忆说话
@@ -256,23 +256,32 @@ class LijianPlugin(Star):
         days = self._recall_days()
         if days > 0:
             cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        picked: list[dict[str, Any]] = []
-        for note in notes:
-            if note.get("kind") != "diary":
-                continue
-            stamp = str(note.get("diary_date") or note.get("updated_at") or "")[:10]
-            if cutoff and stamp and stamp < cutoff:
-                continue
-            picked.append(note)
-        # 日记日期新的在前；同一天按更新时间排。
-        picked.sort(
-            key=lambda n: (
-                str(n.get("diary_date") or "")[:10],
-                str(n.get("updated_at") or ""),
-            ),
-            reverse=True,
-        )
-        return picked[: self._recall_limit()]
+
+        def _diaries(limit_from: str) -> list[dict[str, Any]]:
+            picked: list[dict[str, Any]] = []
+            for note in notes:
+                if note.get("kind") != "diary":
+                    continue
+                stamp = str(note.get("diary_date") or note.get("updated_at") or "")[:10]
+                if limit_from and stamp and stamp < limit_from:
+                    continue
+                picked.append(note)
+            # 日记日期新的在前；同一天按更新时间排。
+            picked.sort(
+                key=lambda n: (
+                    str(n.get("diary_date") or "")[:10],
+                    str(n.get("updated_at") or ""),
+                ),
+                reverse=True,
+            )
+            return picked[: self._recall_limit()]
+
+        picked = _diaries(cutoff)
+        if not picked and cutoff:
+            # 好些天没动笔是常事，不能因此让 AI 彻底接不上话。
+            # 退一步把最近写过的几篇翻给它，标题里的日期自己会说明有多旧。
+            picked = _diaries("")
+        return picked
 
     @staticmethod
     def _recall_stamp(note: dict[str, Any]) -> str:
@@ -364,7 +373,7 @@ class LijianPlugin(Star):
         self._recalled[key] = time.monotonic()
         logger.info(f"璃笺回卷：已翻给 {key} 看，{len(block)} 字")
 
-    @filter.command("lijian_recall")
+    @filter.command("回卷", alias={"lijian_recall"})
     async def lijian_recall(self, event: AstrMessageEvent):
         """看看下次开新上下文时，璃笺会翻哪几篇日记给 AI。"""
         if self._db is None:
@@ -604,7 +613,7 @@ class LijianPlugin(Star):
 
     # ---------- 指令 ----------
 
-    @filter.command("lijian_status")
+    @filter.command("日记状态", alias={"lijian_status"})
     async def lijian_status(self, event: AstrMessageEvent):
         """查看璃笺运行状态。"""
         if self._db is None:
@@ -630,7 +639,7 @@ class LijianPlugin(Star):
             f"归档 {stats.get('archived', 0)} 篇"
         )
 
-    @filter.command("lijian_write")
+    @filter.command("写日记", alias={"lijian_write"})
     async def lijian_write(self, event: AstrMessageEvent, content: str):
         """手动写入一篇日记（追加到今日）。"""
         if self._db is None:
@@ -652,7 +661,7 @@ class LijianPlugin(Star):
             f"已写入璃笺：{note['title']}（{note.get('diary_date') or '无日期'}）"
         )
 
-    @filter.command("lijian_list")
+    @filter.command("日记列表", alias={"lijian_list"})
     async def lijian_list(self, event: AstrMessageEvent, limit: int = 20):
         """列出最近的日记和便签摘要。"""
         if self._db is None:
@@ -673,7 +682,7 @@ class LijianPlugin(Star):
             lines.append(f"{index}. [{kind} {date_str}] {note['title']} (id: {note['id'][:8]}…)")
         yield event.plain_result(f"璃笺书架（共 {len(notes)} 条）：\n" + "\n".join(lines))
 
-    @filter.command("lijian_read")
+    @filter.command("读日记", alias={"lijian_read"})
     async def lijian_read(self, event: AstrMessageEvent, note_id: str):
         """读取某一篇日记或便签的完整内容。"""
         if self._db is None:
@@ -694,7 +703,7 @@ class LijianPlugin(Star):
             f"---\n{excerpt}"
         )
 
-    @filter.command("lijian_delete")
+    @filter.command("删日记", alias={"lijian_delete"})
     async def lijian_delete(self, event: AstrMessageEvent, note_id: str):
         """把某一篇日记或便签移入归档。"""
         if self._db is None:
