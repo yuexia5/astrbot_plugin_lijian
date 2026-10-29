@@ -86,6 +86,50 @@ def local_today() -> str:
     return datetime.now().astimezone().date().isoformat()
 
 
+def local_stamp(moment: Optional[datetime] = None) -> str:
+    """接在后面那一段的落笔时间，形如「—— 2026-10-30 21:22 ——」。
+
+    一天里写两次以上时（白天手动写一次、夜里自动写再接进去），
+    光看段落分不出哪段是白天写的、哪段是补的，中间插一行时间就清楚了。
+    """
+    when = moment or datetime.now().astimezone()
+    return f"—— {when.strftime('%Y-%m-%d %H:%M')} ——"
+
+
+_ATX_HEADING = re.compile(r"^\s*#{1,6}\s+(?P<text>.+?)\s*$")
+_BOLD_LINE = re.compile(r"^\s*(?:\*\*|__)(?P<text>.+?)(?:\*\*|__)\s*[：:]?\s*$")
+
+
+def _squash(text: str) -> str:
+    """去掉书名号、引号、空白和强调符号，只留用来比较的字。"""
+    return re.sub(r"[\s《》〈〉「」『』“”\"'‘’*_#]+", "", text or "")
+
+
+def strip_repeated_title(body: str, title: str) -> str:
+    """删掉正文开头那行跟书名一模一样的标题。
+
+    模型爱在正文第一行再写一遍 `**标题**`，书架顶上已经单独显示了书名，
+    正文里再来一次就是重复。只动第一行，后面的小标题是正文结构，不碰。
+    """
+    if not body or not title:
+        return body
+    target = _squash(title)
+    if not target:
+        return body
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        matched = _ATX_HEADING.match(line) or _BOLD_LINE.match(line)
+        if not matched or _squash(matched.group("text")) != target:
+            return body
+        rest = lines[index + 1 :]
+        while rest and not rest[0].strip():
+            rest.pop(0)
+        return "\n".join(rest).strip() or body
+    return body
+
+
 class DatabaseError(Exception):
     pass
 
@@ -659,9 +703,13 @@ class Database:
             if mode == "append_today":
                 existing = self._find_diary_by_date(diary_date)
                 if existing is not None:
-                    separator = "" if not existing["body_md"].strip() else "\n\n"
-                    merged = f"{existing['body_md']}{separator}{content_md}"
                     title = input_.get("title") or existing["title"]
+                    # 模型偶尔会把书名当正文第一行再写一遍，接进来之前先削掉。
+                    content_md = strip_repeated_title(content_md, title)
+                    separator = "" if not existing["body_md"].strip() else "\n\n"
+                    # 一天写两次以上时，中间插一行落笔时间，免得两段混成一段。
+                    piece = f"{local_stamp()}\n\n{content_md}"
+                    merged = f"{existing['body_md']}{separator}{piece}"
                     # 白天那篇没抽出标题、挂着兜底名的，接上新内容后再抽一次。
                     # 已经有真标题的不动，免得把用户自己起的名盖掉。
                     if title == UNTITLED_TITLE:
@@ -682,10 +730,11 @@ class Database:
                     )
                     self._record_write_event(updated["id"], "astrbot", input_)
                     return updated
+            title = normalize_title(input_.get("title"), content_md)
             note = self.create_note(
                 {
-                    "title": input_.get("title"),
-                    "body_md": content_md,
+                    "title": title,
+                    "body_md": strip_repeated_title(content_md, title),
                     "kind": "diary",
                     "diary_date": diary_date,
                     "tags": input_.get("tags") or [],
@@ -761,6 +810,10 @@ class Database:
                 "streak": streak,
                 "first_date": first_date,
             }
+
+    def diary_of_day(self, diary_date: str) -> Optional[dict[str, Any]]:
+        """某一天的日记，没有就 None。写之前用它判断是开新页还是接着写。"""
+        return self._find_diary_by_date(diary_date)
 
     # ---------- 内部 ----------
 

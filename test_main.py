@@ -2,6 +2,7 @@
 import asyncio
 import gzip
 import json
+import re
 from datetime import datetime, timedelta
 import socket
 import sys
@@ -868,6 +869,11 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     check("append fills placeholder title", night_note["title"] == "今晚这一页", night_note["title"])
     check("append leaves one book for the day", len(day_db.list_notes(False)) == 2, day_db.list_notes(False))
+    check(
+        "append stamps the new paragraph with local time",
+        bool(re.search(r"—— \d{4}-\d{2}-\d{2} \d{2}:\d{2} ——", night_note["body_md"])),
+        night_note["body_md"][-80:],
+    )
 
     keep_db = _fresh_db("write-keep-title")
     titled = keep_db.write_diary_from_ai(
@@ -877,6 +883,24 @@ with tempfile.TemporaryDirectory() as tmp:
         {"content_md": "**今晚这一页**\n\n晚上接进来的。", "mode": "append_today"}
     )
     check("append keeps user title", kept["title"] == "白天那本", kept["title"])
+
+    dup_db = _fresh_db("write-strip-title")
+    dup = dup_db.write_diary_from_ai(
+        {"content_md": "**重复的书名**\n\n正文从这里开始。", "mode": "append_today"}
+    )
+    check(
+        "ai write drops the line that repeats the title",
+        dup["title"] == "重复的书名" and not dup["body_md"].lstrip().startswith("**"),
+        dup["body_md"][:40],
+    )
+    dup_again = dup_db.write_diary_from_ai(
+        {"content_md": "**重复的书名**\n\n第二段接进来。", "mode": "append_today"}
+    )
+    check(
+        "append drops the repeated title too",
+        dup_again["body_md"].count("**重复的书名**") == 0,
+        dup_again["body_md"][-60:],
+    )
 
     new_db = _fresh_db("write-new")
     only_night = new_db.write_diary_from_ai(

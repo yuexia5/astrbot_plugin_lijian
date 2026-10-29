@@ -1,6 +1,7 @@
 """璃笺插件冒烟测试：db + bridge server 端到端。"""
 import asyncio
 import json
+import re
 import sys
 import tempfile
 from datetime import datetime
@@ -229,7 +230,15 @@ async def test_bridge():
             note_id = first["note_id"]
             async with session.get(f"{base}/api/v1/notes/{note_id}", headers=headers) as resp:
                 note = await resp.json(content_type=None)
-                check("note read body", note["note"]["body_md"] == "第一次\n\n第二次")
+                check(
+                    "note read body",
+                    bool(
+                        re.match(
+                            r"^第一次\n\n—— \d{4}-\d{2}-\d{2} \d{2}:\d{2} ——\n\n第二次$",
+                            note["note"]["body_md"],
+                        )
+                    ),
+                )
 
             async with session.patch(
                 f"{base}/api/v1/notes/{note_id}", json={"title": "改标题"}, headers=headers

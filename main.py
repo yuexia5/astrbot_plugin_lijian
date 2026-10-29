@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.5"
+PLUGIN_VERSION = "1.5.6"
 
 
 @register(
@@ -458,7 +458,8 @@ class LijianPlugin(Star):
         这条路不该被「今天已经写过了」「今天没怎么聊」挡下来——他开口要了，
         就该给。挡住的只有定时任务那条路。
 
-        返回 {"ok": bool, "message": str, "note": dict|None, "chars": int}。
+        返回 {"ok": bool, "message": str, "note": dict|None, "chars": int, "total": int}。
+        chars 是这一次新写的字数，total 是这本现在的总字数——接续写的时候两个不一样。
         """
         if self._db is None:
             return {"ok": False, "message": "璃笺数据库不可用。"}
@@ -508,6 +509,20 @@ class LijianPlugin(Star):
         system_prompt = f"{persona}\n\n{AUTO_WRITE_SYSTEM}" if persona else AUTO_WRITE_SYSTEM
 
         today = local_today()
+        # 今天这一页已经有字了，这一次就是接着往下添，不是重开一页。
+        # 不告诉模型的话它会重新起个标题、把刚写过的那件事再讲一遍。
+        continued = False
+        try:
+            existing_today = await asyncio.to_thread(self._db.diary_of_day, today)
+            continued = bool(existing_today and str(existing_today.get("body_md") or "").strip())
+        except Exception:  # noqa: BLE001
+            continued = False
+        continue_hint = (
+            "\n- 今天这一页已经写过了，这次是接着往下添，不是重开一页："
+            "不要另起加粗标题，不要重复前面已经写过的片段和句子，从新的事情写起"
+            if continued
+            else ""
+        )
         # 标签让模型自己给：它知道今天这篇写了什么，写死一个「日记」等于没打。
         tag_hint = (
             "\n- 正文最后另起一行写「标签：a、b、c」，两到三个词，"
@@ -527,6 +542,7 @@ class LijianPlugin(Star):
                 "- 可以写当时没说出口的那半句\n"
                 "- 对方说过的话，挑一句值得记的引上去，别整段搬\n"
                 f"- {length_hint}，可以用一两个小标题，别堆列表和表格"
+                f"{continue_hint}"
                 f"{tag_hint}"
             )
         else:
@@ -540,6 +556,7 @@ class LijianPlugin(Star):
                 "- 可以写怎么打发时间、有没有反复看手机、有没有假装不在意\n"
                 "- 不要编对方说过的话，也不要编这些天发生了什么——什么消息都没有\n"
                 "- 八十到一百五十字，短一点，别铺陈，别抒情到天上去"
+                f"{continue_hint}"
                 f"{tag_hint}"
             )
 
@@ -601,7 +618,13 @@ class LijianPlugin(Star):
             f"璃笺自动写日记完成：{note['title']}"
             f"（用了 {count} 条素材、{len(digest)} 字，写成 {len(body)} 字）"
         )
-        return {"ok": True, "message": "写好了", "note": note, "chars": len(body)}
+        return {
+            "ok": True,
+            "message": "写好了",
+            "note": note,
+            "chars": len(body),
+            "total": len(str(note.get("body_md") or "")),
+        }
 
     # ---------- 自动备份 ----------
 
@@ -896,7 +919,8 @@ class LijianPlugin(Star):
                 return
             note = result.get("note") or {}
             yield event.plain_result(
-                f"写好了：《{note.get('title') or '日记'}》，{result.get('chars') or 0} 字"
+                f"写好了：《{note.get('title') or '日记'}》，本次 {result.get('chars') or 0} 字，"
+                f"全书 {result.get('total') or 0} 字"
             )
             return
         if self._db is None:
