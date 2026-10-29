@@ -671,6 +671,11 @@ with tempfile.TemporaryDirectory() as tmp:
         group_event = AstrMessageEvent(text="群里说一句", private=False, session="g1")
         await plugin.collect_material_on_request(group_event, ProviderRequest())
         check("material skipped in group", len(plugin._db.material_pool()) == 2)
+        check(
+            "last material session survives an empty pool",
+            plugin._db.last_material_session() == pool[-1]["s"] != "",
+            plugin._db.last_material_session(),
+        )
 
         # 今天刚写过、现在也没话：一个 token 都不该花
         provider = FakeProvider("不该被调用")

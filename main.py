@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.6"
+PLUGIN_VERSION = "1.5.7"
 
 
 @register(
@@ -503,6 +503,10 @@ class LijianPlugin(Star):
             pool = await asyncio.to_thread(self._db.material_pool, cursor)
             if pool:
                 session = str(pool[-1].get("s") or "")
+            if not session:
+                # 这一次没有新素材也要有个会话可用：跟着最近聊过的那条走，
+                # 不然会退到全局默认的 provider——那里可能躺着一个早就下线的模型。
+                session = await asyncio.to_thread(self._db.last_material_session)
         except Exception:  # noqa: BLE001
             pass
         persona = await self._persona_prompt(session)

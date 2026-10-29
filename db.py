@@ -955,6 +955,18 @@ class Database:
             for row in rows
         ]
 
+    def last_material_session(self) -> str:
+        """最近一条素材来自哪个会话。
+
+        这一次没有新素材时（游标已经推到最新），也要知道该跟着谁的主模型写，
+        否则会退到全局默认那个 provider，那里常常是个早就下线的模型。
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT session FROM diary_materials ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return str(row["session"] or "") if row is not None else ""
+
     def material_pending(self) -> int:
         """还有多少条没被写进日记。状态指令用它报数。"""
         cursor = self.material_cursor()
