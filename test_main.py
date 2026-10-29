@@ -923,4 +923,38 @@ with tempfile.TemporaryDirectory() as tmp:
     check("bridge stopped after terminate", not plugin._bridge or not plugin._bridge.running)
     check("db closed", plugin._db is None)
 
+    # 热重载时框架先 new 新实例、再 terminate 旧实例。旧实例的库若照常关掉，
+    # 全局 llm_tools 里那几件工具还指着旧 self，就一律报「数据库不可用」。
+    class _FakeMeta:
+        name = plugin_main.PLUGIN_NAME
+        module_path = "astrbot_plugin_lijian.main"
+
+    old = plugin_main.LijianPlugin(ctx, config)   # 旧身
+    new = plugin_main.LijianPlugin(ctx, config)   # 新身，已经开好库
+    _FakeMeta.star_cls = new
+
+    class _FakeHandlerModule:
+        star_map = {"astrbot_plugin_lijian.main": _FakeMeta}
+
+    class _FakeStarPkg:
+        star_handler = _FakeHandlerModule
+
+    saved = sys.modules.get("astrbot.core.star.star_handler")
+    sys.modules["astrbot.core.star.star_handler"] = _FakeHandlerModule
+    try:
+        asyncio.run(old.terminate())
+        check("old instance keeps new instance db alive", new._db is not None)
+        check("old instance marks itself superseded", old._superseded is True)
+        check("old instance tool borrows new db", old._live_db() is new._db)
+        check(
+            "old instance tool can still read the shelf",
+            isinstance(old._live_db().list_notes(True), list),
+        )
+    finally:
+        if saved is None:
+            sys.modules.pop("astrbot.core.star.star_handler", None)
+        else:
+            sys.modules["astrbot.core.star.star_handler"] = saved
+    new._release_own_resources()
+
 print(f"\n全部通过（{PASS} 项检查）")

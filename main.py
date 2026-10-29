@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.7"
+PLUGIN_VERSION = "1.5.8"
 
 
 @register(
@@ -148,6 +148,11 @@ PLUGIN_VERSION = "1.5.7"
 class LijianPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        # 这个实例是不是被热重载换下来的旧身。
+        # AstrBot 热重载插件时会先 new 新实例、再 terminate 旧实例。旧实例的
+        # terminate() 里若照常关库，登记在全局 llm_tools 里的那几件工具还指着旧 self，
+        # 于是书架的三个工具一律报「数据库不可用」，非得重启进程才好。
+        self._superseded = False
         self.config = config
         self._db: Database | None = None
         self._bridge: BridgeServer | None = None
@@ -164,6 +169,69 @@ class LijianPlugin(Star):
             self._register_web_apis()
 
     # ---------- 生命周期 ----------
+
+    @staticmethod
+    def _newest_live_instance() -> "LijianPlugin | None":
+        """当前活着的最新那个实例。
+
+        AstrBot 的 star_map 里存的永远是最新加载的那个对象；热重载时它已经换成了
+        新身，而全局 llm_tools 里还没重新绑定，旧身的方法还在被调用。
+        认亲用插件名比模块路径可靠：模块路径随测试或加载方式变，插件名不变。
+        """
+        try:
+            from astrbot.core.star.star_handler import star_map  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            for smd in list(star_map.values()):
+                if getattr(smd, "name", "") != PLUGIN_NAME:
+                    continue
+                inst = getattr(smd, "star_cls", None)
+                if isinstance(inst, LijianPlugin) and inst._db is not None:
+                    return inst
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _taking_over(self) -> "LijianPlugin | None":
+        """自己若已被换下，就返回接手的新实例；否则返回 None。
+
+        做法很简单：去全局表里看一眼「最新那个实例」是不是自己。
+        不是自己，就把手上的库关掉、标记作废，后续一律借新身干活。
+        这样无论框架先 new 后 terminate、还是先 terminate 后 new，都不会误关谁的库。
+        """
+        newest = self._newest_live_instance()
+        if newest is None or newest is self:
+            return None
+        if not getattr(self, "_superseded", False):
+            self._superseded = True
+            logger.info("璃笺检测到自己已被重载换下，关闭旧实例的库，工具转交给新实例。")
+            self._release_own_resources()
+        return newest
+
+    def _release_own_resources(self) -> None:
+        try:
+            self._stop_backup_service()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._bridge is not None:
+            try:
+                self._bridge.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._bridge = None
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._db = None
+
+    def _live_db(self) -> Database | None:
+        newest = self._taking_over()
+        if newest is not None:
+            return newest._db
+        return self._db
 
     def _resolve_data_dir(self) -> Path:
         base: Path | None = None
@@ -295,7 +363,7 @@ class LijianPlugin(Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
         """聊天时顺手把对方的话记进素材池。"""
-        if not self._auto_write_enabled() or self._db is None:
+        if not self._auto_write_enabled() or self._live_db() is None:
             return
         if not event.is_private_chat():
             return
@@ -304,7 +372,7 @@ class LijianPlugin(Star):
             return
         try:
             await asyncio.to_thread(
-                self._db.material_append, event.unified_msg_origin, "user", text
+                self._live_db().material_append, event.unified_msg_origin, "user", text
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺记录聊天素材失败: {exc}")
@@ -314,7 +382,7 @@ class LijianPlugin(Star):
         self, event: AstrMessageEvent, response: Any
     ):
         """把自己说的话也记进去，写日记时才知道当时怎么应的。"""
-        if not self._auto_write_enabled() or self._db is None:
+        if not self._auto_write_enabled() or self._live_db() is None:
             return
         if not event.is_private_chat():
             return
@@ -323,7 +391,7 @@ class LijianPlugin(Star):
             return
         try:
             await asyncio.to_thread(
-                self._db.material_append, event.unified_msg_origin, "assistant", text
+                self._live_db().material_append, event.unified_msg_origin, "assistant", text
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺记录聊天素材失败: {exc}")
@@ -374,7 +442,7 @@ class LijianPlugin(Star):
 
     def _auto_write_done_today(self) -> bool:
         try:
-            last = self._db.state_get("auto_write", {}) or {}
+            last = self._live_db().state_get("auto_write", {}) or {}
         except Exception:  # noqa: BLE001
             return False
         return isinstance(last, dict) and str(last.get("date", "")) == local_today()
@@ -436,7 +504,7 @@ class LijianPlugin(Star):
     def _days_since_last_diary(self) -> int:
         """距上一篇日记几天。一篇都没写过（或者读不出来）返回 -1。"""
         try:
-            last = self._db.last_diary_date()
+            last = self._live_db().last_diary_date()
         except Exception:  # noqa: BLE001
             return -1
         if not last:
@@ -461,16 +529,16 @@ class LijianPlugin(Star):
         返回 {"ok": bool, "message": str, "note": dict|None, "chars": int, "total": int}。
         chars 是这一次新写的字数，total 是这本现在的总字数——接续写的时候两个不一样。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return {"ok": False, "message": "璃笺数据库不可用。"}
         # 一天只写一篇。定时任务万一被重载多排了一次，也不能写两篇、扣两次额度。
         if not manual and self._auto_write_done_today():
             logger.info("璃笺自动写日记：今天已经写过了，跳过")
             return {"ok": False, "message": "今天已经写过了"}
         try:
-            cursor = await asyncio.to_thread(self._db.material_cursor)
+            cursor = await asyncio.to_thread(self._live_db().material_cursor)
             digest, count, last_id = await asyncio.to_thread(
-                self._db.material_digest, cursor, AUTO_MATERIAL_MAX_CHARS
+                self._live_db().material_digest, cursor, AUTO_MATERIAL_MAX_CHARS
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺读取聊天素材失败: {exc}")
@@ -500,13 +568,13 @@ class LijianPlugin(Star):
         # 用哪个会话的 umo 取人格：素材里最后说话的那个；没素材就用默认人格。
         session = ""
         try:
-            pool = await asyncio.to_thread(self._db.material_pool, cursor)
+            pool = await asyncio.to_thread(self._live_db().material_pool, cursor)
             if pool:
                 session = str(pool[-1].get("s") or "")
             if not session:
                 # 这一次没有新素材也要有个会话可用：跟着最近聊过的那条走，
                 # 不然会退到全局默认的 provider——那里可能躺着一个早就下线的模型。
-                session = await asyncio.to_thread(self._db.last_material_session)
+                session = await asyncio.to_thread(self._live_db().last_material_session)
         except Exception:  # noqa: BLE001
             pass
         persona = await self._persona_prompt(session)
@@ -517,7 +585,7 @@ class LijianPlugin(Star):
         # 不告诉模型的话它会重新起个标题、把刚写过的那件事再讲一遍。
         continued = False
         try:
-            existing_today = await asyncio.to_thread(self._db.diary_of_day, today)
+            existing_today = await asyncio.to_thread(self._live_db().diary_of_day, today)
             continued = bool(existing_today and str(existing_today.get("body_md") or "").strip())
         except Exception:  # noqa: BLE001
             continued = False
@@ -588,7 +656,7 @@ class LijianPlugin(Star):
             ai_tags = ["日记"]
         try:
             note = await asyncio.to_thread(
-                self._db.write_diary_from_ai,
+                self._live_db().write_diary_from_ai,
                 {
                     "content_md": body,
                     "title": None,
@@ -603,11 +671,11 @@ class LijianPlugin(Star):
         # 写成功了才推进游标：这一次失败不该把这些话算成已经写过。
         # 推进而不是清空，所以今天 23 点之后聊的那几句会接着进明天那一篇。
         try:
-            await asyncio.to_thread(self._db.material_set_cursor, last_id)
+            await asyncio.to_thread(self._live_db().material_set_cursor, last_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺推进素材游标失败: {exc}")
         try:
-            self._db.state_set(
+            self._live_db().state_set(
                 "auto_write",
                 {
                     "date": local_today(),
@@ -714,9 +782,9 @@ class LijianPlugin(Star):
         return info
 
     def _backup_due(self) -> bool:
-        if not self._backup_enabled() or self._db is None:
+        if not self._backup_enabled() or self._live_db() is None:
             return False
-        last = self._db.state_get("last_backup", {}) or {}
+        last = self._live_db().state_get("last_backup", {}) or {}
         last_date = str(last.get("date", "")) if isinstance(last, dict) else ""
         if last_date == local_today():
             return False
@@ -791,21 +859,21 @@ class LijianPlugin(Star):
         register(f"/{PLUGIN_NAME}/status", self.api_status, ["GET"], "书架：运行状态")
 
     async def terminate(self):
-        self._stop_backup_service()
-        if self._bridge is not None:
-            self._bridge.stop()
-            self._bridge = None
-        if self._db is not None:
-            self._db.close()
-            self._db = None
+        # 热重载时框架可能已经先建好了新实例。这时自己已被换下，
+        # 库要留给新实例用，这里不许关，更不能误关新身上那一个。
+        if self._taking_over() is not None:
+            logger.info("璃笺旧实例收尾（已被新实例接手，库留给新实例）。")
+            return
+        self._release_own_resources()
         logger.info("璃笺插件已卸载。")
 
     # ---------- 内部工具 ----------
 
     def _require_db(self) -> Database:
-        if self._db is None:
+        db = self._live_db()
+        if db is None:
             raise RuntimeError("璃笺数据库不可用")
-        return self._db
+        return db
 
     def _bridge_running(self) -> bool:
         return bool(self._bridge and self._bridge.running)
@@ -839,16 +907,16 @@ class LijianPlugin(Star):
     @filter.command("日记状态", alias={"lijian_status"})
     async def lijian_status(self, event: AstrMessageEvent):
         """看看日记本现在怎么样。"""
-        if self._db is None:
+        if self._live_db() is None:
             yield event.plain_result("日记本打不开了，检查一下 AstrBot 的数据目录能不能写。")
             return
         try:
-            stats = self._db.stats()
+            stats = self._live_db().stats()
         except Exception as exc:  # noqa: BLE001
             stats = {"notes": 0, "words": 0, "archived": 0}
             logger.warning(f"璃笺统计失败: {exc}")
         try:
-            material_count = self._db.material_pending()
+            material_count = self._live_db().material_pending()
         except Exception:  # noqa: BLE001
             material_count = 0
 
@@ -861,7 +929,7 @@ class LijianPlugin(Star):
         if not self._auto_write_enabled():
             lines.append("自己写日记：关了")
         elif self._auto_write_done_today():
-            last = self._db.state_get("auto_write", {}) or {}
+            last = self._live_db().state_get("auto_write", {}) or {}
             lines.append(
                 f"自己写日记：今天已经写好了"
                 f"（{last.get('at', '')}，{last.get('chars', 0)} 字）"
@@ -927,11 +995,11 @@ class LijianPlugin(Star):
                 f"全书 {result.get('total') or 0} 字"
             )
             return
-        if self._db is None:
+        if self._live_db() is None:
             yield event.plain_result("璃笺数据库不可用。")
             return
         try:
-            note = self._db.write_diary_from_ai(
+            note = self._live_db().write_diary_from_ai(
                 {
                     "content_md": text,
                     "title": None,
@@ -949,11 +1017,11 @@ class LijianPlugin(Star):
     @filter.command("日记列表", alias={"lijian_list"})
     async def lijian_list(self, event: AstrMessageEvent, limit: int = 20):
         """列出最近的日记和便签摘要。"""
-        if self._db is None:
+        if self._live_db() is None:
             yield event.plain_result("璃笺数据库不可用。")
             return
         try:
-            notes = self._db.list_notes(False)[: max(1, min(int(limit), 50))]
+            notes = self._live_db().list_notes(False)[: max(1, min(int(limit), 50))]
         except Exception as exc:
             yield event.plain_result(f"璃笺列表读取失败：{exc}")
             return
@@ -970,7 +1038,7 @@ class LijianPlugin(Star):
     def _recent_notes_hint(self, limit: int = 5) -> str:
         """不带 id 时给人看的一份小清单，省得去书架上翻。"""
         try:
-            notes = self._db.list_notes(False)[:limit]
+            notes = self._live_db().list_notes(False)[:limit]
         except Exception as exc:  # noqa: BLE001
             return f"书架读取失败：{exc}"
         if not notes:
@@ -984,7 +1052,7 @@ class LijianPlugin(Star):
     @filter.command("读日记", alias={"lijian_read"})
     async def lijian_read(self, event: AstrMessageEvent, note_id: str = ""):
         """读取某一篇日记或便签的完整内容。不带 id 时列出最近几篇。"""
-        if self._db is None:
+        if self._live_db() is None:
             yield event.plain_result("璃笺数据库不可用。")
             return
         note_id = (note_id or "").strip()
@@ -995,7 +1063,7 @@ class LijianPlugin(Star):
             )
             return
         try:
-            note = self._db.get_note(note_id)
+            note = self._live_db().get_note(note_id)
         except Exception as exc:
             yield event.plain_result(f"璃笺读取失败：{exc}")
             return
@@ -1012,7 +1080,7 @@ class LijianPlugin(Star):
     @filter.command("删日记", alias={"lijian_delete"})
     async def lijian_delete(self, event: AstrMessageEvent, note_id: str = ""):
         """把某一篇日记或便签移入归档。不带 id 时列出最近几篇。"""
-        if self._db is None:
+        if self._live_db() is None:
             yield event.plain_result("璃笺数据库不可用。")
             return
         note_id = (note_id or "").strip()
@@ -1024,7 +1092,7 @@ class LijianPlugin(Star):
             )
             return
         try:
-            note = self._db.archive_note(note_id, True)
+            note = self._live_db().archive_note(note_id, True)
         except Exception as exc:
             yield event.plain_result(f"璃笺归档失败：{exc}")
             return
@@ -1054,14 +1122,14 @@ class LijianPlugin(Star):
             tags(string): 标签，多个标签用英文逗号分隔。
             mode(string): 写入模式，append_today 表示追加到当日，create 表示创建新日记。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return json.dumps(
                 {"ok": False, "error": "db unavailable", "message": "璃笺数据库不可用"},
                 ensure_ascii=False,
             )
         mode = mode or self.config.get("default_mode", "append_today")
         try:
-            note = self._db.write_diary_from_ai(
+            note = self._live_db().write_diary_from_ai(
                 {
                     "content_md": content_md,
                     "title": title or None,
@@ -1100,10 +1168,10 @@ class LijianPlugin(Star):
         Args:
             include_archived(bool): 是否包含已归档条目，默认 false。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return self._tool_error("璃笺列表读取失败", RuntimeError("数据库不可用"))
         try:
-            notes = self._db.list_notes(include_archived=include_archived)
+            notes = self._live_db().list_notes(include_archived=include_archived)
         except Exception as exc:
             logger.warning(f"璃笺列表读取失败: {exc}")
             return self._tool_error("璃笺列表读取失败", exc)
@@ -1134,7 +1202,7 @@ class LijianPlugin(Star):
             until(string): 截止日期，格式 YYYY-MM-DD，可为空表示不限。
             limit(int): 最多返回几条，默认 8，上限 50。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return self._tool_error("璃笺检索失败", RuntimeError("数据库不可用"))
         try:
             limit = max(1, min(int(limit or 8), 50))
@@ -1156,10 +1224,10 @@ class LijianPlugin(Star):
         try:
             if str(keyword or "").strip():
                 notes = await asyncio.to_thread(
-                    self._db.search_notes, str(keyword).strip(), False, 500
+                    self._live_db().search_notes, str(keyword).strip(), False, 500
                 )
             else:
-                notes = await asyncio.to_thread(self._db.list_notes, False)
+                notes = await asyncio.to_thread(self._live_db().list_notes, False)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺检索失败: {exc}")
             return self._tool_error("璃笺检索失败", exc)
@@ -1224,7 +1292,7 @@ class LijianPlugin(Star):
             start_date(string): 起始日期 YYYY-MM-DD，留空表示本周一。
             end_date(string): 结束日期 YYYY-MM-DD，留空表示今天。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return self._tool_error("璃笺周报读取失败", RuntimeError("数据库不可用"))
         default_start, default_end = local_week_range()
         start = (start_date or default_start).strip()
@@ -1236,7 +1304,7 @@ class LijianPlugin(Star):
         if start > end:
             start, end = end, start
         try:
-            notes = self._db.notes_in_range(start, end)
+            notes = self._live_db().notes_in_range(start, end)
         except Exception as exc:
             logger.warning(f"璃笺周报读取失败: {exc}")
             return self._tool_error("璃笺周报读取失败", exc)
@@ -1262,10 +1330,10 @@ class LijianPlugin(Star):
         Args:
             note_id(string): 要读取的璃笺 note_id。通常先调用 list_lijian_notes 获取。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return self._tool_error("璃笺读取失败", RuntimeError("数据库不可用"))
         try:
-            note = self._db.get_note(note_id)
+            note = self._live_db().get_note(note_id)
         except Exception as exc:
             logger.warning(f"璃笺读取失败: {exc}")
             return self._tool_error("璃笺读取失败", exc)
@@ -1284,10 +1352,10 @@ class LijianPlugin(Star):
         Args:
             note_id(string): 要删除的璃笺 note_id。通常先调用 list_lijian_notes 获取。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return self._tool_error("璃笺删除失败", RuntimeError("数据库不可用"))
         try:
-            note = self._db.archive_note(note_id, True)
+            note = self._live_db().archive_note(note_id, True)
         except Exception as exc:
             logger.warning(f"璃笺删除失败: {exc}")
             return self._tool_error("璃笺删除失败", exc)
@@ -1316,10 +1384,10 @@ class LijianPlugin(Star):
             tags(string): 新标签，多个标签用英文逗号分隔；为空则不修改标签。
             kind(string): 条目类型，note 或 diary；为空则不修改类型。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return self._tool_error("璃笺修改失败", RuntimeError("数据库不可用"))
         try:
-            note = self._db.update_note(
+            note = self._live_db().update_note(
                 note_id,
                 {
                     **({"content_md": content_md} if content_md else {}),
@@ -1339,7 +1407,7 @@ class LijianPlugin(Star):
     # ---------- 书架 Web API ----------
 
     async def api_list_notes(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         include_archived = request.query.get("include_archived", "false").lower() in (
             "1",
@@ -1359,12 +1427,12 @@ class LijianPlugin(Star):
         # 搜索下沉到 SQL：前端不用把整库正文拉下来再过滤。
         matched = None
         if q:
-            notes = self._db.search_notes(q, include_archived)
+            notes = self._live_db().search_notes(q, include_archived)
             # 命中数超过一页时，告诉前端一共多少，别让人以为只剩这些。
             if len(notes) >= SEARCH_LIMIT:
-                matched = self._db.search_count(q, include_archived)
+                matched = self._live_db().search_count(q, include_archived)
         else:
-            notes = self._db.list_notes(include_archived, light=light)
+            notes = self._live_db().list_notes(include_archived, light=light)
         if kind in ("diary", "note"):
             notes = [note for note in notes if note["kind"] == kind]
         payload = {"notes": [self._summary(note, include_body) for note in notes]}
@@ -1373,15 +1441,15 @@ class LijianPlugin(Star):
         return json_response(payload)
 
     async def api_get_note(self, note_id: str):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            return json_response({"note": self._db.get_note(note_id)})
+            return json_response({"note": self._live_db().get_note(note_id)})
         except Exception as exc:
             return error_response(str(exc), status_code=404)
 
     async def api_create_note(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         payload = await request.json(default={})
         title = payload.get("title") or ""
@@ -1392,7 +1460,7 @@ class LijianPlugin(Star):
         except DatabaseError as exc:
             return error_response(str(exc))
         try:
-            note = self._db.create_note(
+            note = self._live_db().create_note(
                 {
                     "title": title,
                     "body_md": body_md,
@@ -1407,7 +1475,7 @@ class LijianPlugin(Star):
         return json_response({"note": note})
 
     async def api_update_note(self, note_id: str):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         payload = await request.json(default={})
         patch: dict = {}
@@ -1424,25 +1492,25 @@ class LijianPlugin(Star):
         if not patch:
             return error_response("没有要修改的字段")
         try:
-            note = self._db.update_note(note_id, patch)
+            note = self._live_db().update_note(note_id, patch)
         except Exception as exc:
             return error_response(str(exc), status_code=404 if "not found" in str(exc) else 400)
         return json_response({"note": note})
 
     async def api_archive_note(self, note_id: str):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            note = self._db.archive_note(note_id, True)
+            note = self._live_db().archive_note(note_id, True)
         except Exception as exc:
             return error_response(str(exc), status_code=404 if "not found" in str(exc) else 400)
         return json_response({"note": self._summary(note), "message": "已归档"})
 
     async def api_restore_note(self, note_id: str):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            note = self._db.archive_note(note_id, False)
+            note = self._live_db().archive_note(note_id, False)
         except Exception as exc:
             return error_response(str(exc), status_code=404 if "not found" in str(exc) else 400)
         return json_response({"note": self._summary(note), "message": "已恢复"})
@@ -1454,10 +1522,10 @@ class LijianPlugin(Star):
         return self._toggle_pin(note_id, False)
 
     def _toggle_pin(self, note_id: str, pinned: bool):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            note = self._db.pin_note(note_id, pinned)
+            note = self._live_db().pin_note(note_id, pinned)
         except Exception as exc:
             return error_response(
                 str(exc), status_code=404 if "not found" in str(exc) else 400
@@ -1467,12 +1535,12 @@ class LijianPlugin(Star):
         )
 
     async def api_random_note(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         kind = request.query.get("kind")
         exclude = request.query.get("exclude") or None
         try:
-            note = self._db.random_note(
+            note = self._live_db().random_note(
                 kind if kind in ("note", "diary") else None, exclude
             )
         except Exception as exc:
@@ -1483,13 +1551,13 @@ class LijianPlugin(Star):
 
     async def api_on_this_day(self):
         """往年的今天。只回摘要，正文等点开再取。"""
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         day = (request.query.get("date") or local_today()).strip()
         if not DATE_RE.match(day):
             return error_response("日期格式应为 YYYY-MM-DD")
         try:
-            notes = self._db.on_this_day(day, limit=10)
+            notes = self._live_db().on_this_day(day, limit=10)
         except Exception as exc:
             return error_response(str(exc))
         items = []
@@ -1502,7 +1570,7 @@ class LijianPlugin(Star):
         return json_response({"date": day, "count": len(items), "items": items})
 
     async def api_list_backups(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         items = []
         for path in self._backup_files():
@@ -1522,13 +1590,13 @@ class LijianPlugin(Star):
                 "dir": str(self._backup_dir()),
                 "keep": self._backup_keep(),
                 "enabled": self._backup_enabled(),
-                "last": self._db.state_get("last_backup", {}),
+                "last": self._live_db().state_get("last_backup", {}),
                 "items": items,
             }
         )
 
     async def api_backup_now(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
             info = await asyncio.to_thread(self._run_backup)
@@ -1543,7 +1611,7 @@ class LijianPlugin(Star):
         前端不用解压，也不受 JSON 请求体大小限制；临时文件放大盘上，
         这台机器的 /tmp 只有 10M，备份一旦超过就直接写不进去。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         files = await request.files()
         upload = files.get("file") if files else None
@@ -1577,7 +1645,7 @@ class LijianPlugin(Star):
                 payload = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 return error_response("不是合法的 JSON 备份")
-            result = self._db.import_json(payload)
+            result = self._live_db().import_json(payload)
         except Exception as exc:  # noqa: BLE001
             return error_response(str(exc))
         finally:
@@ -1594,16 +1662,16 @@ class LijianPlugin(Star):
 
     async def api_signature(self):
         """给书架页轮询用：只回一行签名，比每次拉全表便宜得多。"""
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            return json_response({"signature": self._db.note_signature()})
+            return json_response({"signature": self._live_db().note_signature()})
         except Exception as exc:
             return error_response(str(exc))
 
     async def api_weekly(self):
         """把一段时间的日记聚成 Markdown 素材，人工看或交给 AI 总结都行。"""
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         default_start, default_end = local_week_range()
         start = (request.query.get("start") or default_start).strip()
@@ -1613,7 +1681,7 @@ class LijianPlugin(Star):
         if start > end:
             start, end = end, start
         try:
-            notes = self._db.notes_in_range(start, end)
+            notes = self._live_db().notes_in_range(start, end)
         except Exception as exc:
             return error_response(str(exc))
         return json_response(
@@ -1628,7 +1696,7 @@ class LijianPlugin(Star):
 
     async def api_upload_media(self):
         """图片存到插件数据目录的 media/ 下，正文里引用 media/<文件名>。"""
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         files = await request.files()
         upload = files.get("file") if files else None
@@ -1693,14 +1761,14 @@ class LijianPlugin(Star):
         )
 
     async def api_write_diary(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         payload = await request.json(default={})
         content_md = payload.get("content_md") or ""
         if not content_md.strip():
             return error_response("content_md 不能为空")
         try:
-            note = self._db.write_diary_from_ai(
+            note = self._live_db().write_diary_from_ai(
                 {
                     "content_md": content_md,
                     "title": payload.get("title") or None,
@@ -1714,22 +1782,22 @@ class LijianPlugin(Star):
         return json_response({"note": note, "message": "已写入今日日记"})
 
     async def api_note_markdown(self, note_id: str):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            note = self._db.get_note(note_id)
+            note = self._live_db().get_note(note_id)
         except Exception as exc:
             return error_response(str(exc), status_code=404)
         filename = f"{date_prefix(note)}-{safe_filename(note['title'])}.md"
         return json_response({"filename": filename, "content": markdown_for_note(note)})
 
     async def api_export_all(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         # 导出后的 zip 要留到浏览器下载完，不能立刻删；顺手清掉一小时前的旧包。
         cleanup_temp_files("lijian-export-*.zip")
         tmp = Path(tempfile.gettempdir()) / f"lijian-export-{uuid4().hex}.zip"
-        notes = self._db.list_notes(False)
+        notes = self._live_db().list_notes(False)
         try:
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
                 for note in notes:
@@ -1747,10 +1815,10 @@ class LijianPlugin(Star):
 
         直接把 JSON 文本回给前端下载，不落临时文件，也就没有清理问题。
         """
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         try:
-            data = self._db.export_json()
+            data = self._live_db().export_json()
         except Exception as exc:
             return error_response(str(exc))
         return json_response(
@@ -1762,11 +1830,11 @@ class LijianPlugin(Star):
         )
 
     async def api_import_json(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         payload = await request.json(default={})
         try:
-            result = self._db.import_json(payload)
+            result = self._live_db().import_json(payload)
         except Exception as exc:
             return error_response(str(exc))
         return json_response(
@@ -1777,7 +1845,7 @@ class LijianPlugin(Star):
         )
 
     async def api_import(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         files = await request.files()
         upload = files.get("file") if files else None
@@ -1801,7 +1869,7 @@ class LijianPlugin(Star):
                     f"文件太大（{size // 1024} KB），单篇导入上限 "
                     f"{MAX_IMPORT_BYTES // 1024} KB"
                 )
-            notes = self._db.import_markdown_files([str(tmp)])
+            notes = self._live_db().import_markdown_files([str(tmp)])
         except Exception as exc:
             return error_response(str(exc))
         finally:
@@ -1813,14 +1881,14 @@ class LijianPlugin(Star):
         return json_response({"notes": [self._summary(note) for note in notes], "count": len(notes)})
 
     async def api_stats(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
-        stats = self._db.stats()
+        stats = self._live_db().stats()
         stats["words"] = stats.get("words", 0)
         return json_response(stats)
 
     async def api_status(self):
-        if self._db is None:
+        if self._live_db() is None:
             return error_response("数据库不可用")
         template = str(self.config.get("diary_template", "") or "")
         if not template.strip():
@@ -1830,21 +1898,21 @@ class LijianPlugin(Star):
                 "ok": True,
                 "name": "璃笺",
                 "version": PLUGIN_VERSION,
-                "db_path": self._db.path,
+                "db_path": self._live_db().path,
                 "bridge": {
                     "enabled": self._bridge is not None,
                     "running": self._bridge_running(),
                     "host": getattr(self._bridge, "host", None),
                     "port": getattr(self._bridge, "port", None),
                 },
-                "token": self._db.settings()["ai_token"],
-                "stats": self._db.stats(),
+                "token": self._live_db().settings()["ai_token"],
+                "stats": self._live_db().stats(),
                 "backup": {
                     "enabled": self._backup_enabled(),
                     "dir": str(self._backup_dir()),
                     "keep": self._backup_keep(),
                     "files": len(self._backup_files()),
-                    "last": self._db.state_get("last_backup", {}),
+                    "last": self._live_db().state_get("last_backup", {}),
                 },
                 "diary_template": template,
                 # 前端拼图片地址时要用；拿不到就让它退回按 location 推。
