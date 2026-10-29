@@ -18,6 +18,9 @@ from uuid import uuid4
 
 from astrbot.api import logger
 
+# 取不到标题时的兜底名。追加内容时看到它，说明当初没抽到，可以再抽一次。
+UNTITLED_TITLE = "未命名便签"
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -657,11 +660,17 @@ class Database:
                 existing = self._find_diary_by_date(diary_date)
                 if existing is not None:
                     separator = "" if not existing["body_md"].strip() else "\n\n"
+                    merged = f"{existing['body_md']}{separator}{content_md}"
+                    title = input_.get("title") or existing["title"]
+                    # 白天那篇没抽出标题、挂着兜底名的，接上新内容后再抽一次。
+                    # 已经有真标题的不动，免得把用户自己起的名盖掉。
+                    if title == UNTITLED_TITLE:
+                        title = normalize_title(None, merged)
                     updated = self.update_note(
                         existing["id"],
                         {
-                            "title": input_.get("title") or existing["title"],
-                            "body_md": f"{existing['body_md']}{separator}{content_md}",
+                            "title": title,
+                            "body_md": merged,
                             "kind": "diary",
                             "diary_date": diary_date,
                             # 追加时合并标签：AI 每次带 AstrBot/日记 不该冲掉用户手写的标签
@@ -1041,7 +1050,7 @@ def markdown_for_note(note: dict[str, Any]) -> str:
 def normalize_title(title: Any, body: str) -> str:
     if isinstance(title, str) and title.strip():
         return title.strip()
-    return first_markdown_heading(body) or "未命名便签"
+    return first_markdown_heading(body) or UNTITLED_TITLE
 
 
 def first_markdown_heading(body: str) -> Optional[str]:

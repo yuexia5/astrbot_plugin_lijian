@@ -351,6 +351,14 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     token = plugin._db.settings()["ai_token"]
     check("token auto generated", token.startswith("lijian-"))
+    # 第一笺只是欢迎语，不该占着「今天」这个位置，
+    # 否则安装当天 23:00 的自动写会把正文接在欢迎语后面。
+    seed = plugin._db.list_notes(True)[0]
+    check("seed note has no diary_date", not seed.get("diary_date"), seed.get("diary_date"))
+    check(
+        "seed not treated as today's diary",
+        plugin._db._find_diary_by_date(plugin_main.local_today()) is None,
+    )
     check("bridge running", plugin._bridge is not None and plugin._bridge.running)
     check(
         "backup created at startup",
@@ -827,6 +835,59 @@ with tempfile.TemporaryDirectory() as tmp:
         )
 
     asyncio.run(run_auto_write())
+
+    # ---- 晚间自动写的落点：白天写过就接进去，没写过才起新书 ----
+    import db as db_module
+
+    def _fresh_db(name):
+        fresh = db_module.Database(Path(tmp) / f"{name}.sqlite3")
+        fresh.create_note(
+            {
+                "title": "第一笺",
+                "body_md": "# 第一笺\n\n今天想记下什么？",
+                "kind": "diary",
+                "diary_date": None,
+                "tags": ["璃笺"],
+                "source": "local",
+            }
+        )
+        return fresh
+
+    day_db = _fresh_db("write-append")
+    day_note = day_db.write_diary_from_ai(
+        {"content_md": "白天随手写的，没有标题行。", "mode": "append_today"}
+    )
+    check("daytime write without heading falls back", day_note["title"] == db_module.UNTITLED_TITLE)
+    night_note = day_db.write_diary_from_ai(
+        {"content_md": "**今晚这一页**\n\n晚上自动写的。", "mode": "append_today"}
+    )
+    check("auto write appends to daytime book", night_note["id"] == day_note["id"])
+    check(
+        "append keeps both paragraphs",
+        "白天随手写的" in night_note["body_md"] and "晚上自动写的" in night_note["body_md"],
+    )
+    check("append fills placeholder title", night_note["title"] == "今晚这一页", night_note["title"])
+    check("append leaves one book for the day", len(day_db.list_notes(False)) == 2, day_db.list_notes(False))
+
+    keep_db = _fresh_db("write-keep-title")
+    titled = keep_db.write_diary_from_ai(
+        {"content_md": "**白天那本**\n\n白天写的。", "mode": "append_today"}
+    )
+    kept = keep_db.write_diary_from_ai(
+        {"content_md": "**今晚这一页**\n\n晚上接进来的。", "mode": "append_today"}
+    )
+    check("append keeps user title", kept["title"] == "白天那本", kept["title"])
+
+    new_db = _fresh_db("write-new")
+    only_night = new_db.write_diary_from_ai(
+        {"content_md": "**今晚这一页**\n\n晚上自动写的。", "mode": "append_today"}
+    )
+    check("quiet daytime starts a new book", only_night["id"] != "", only_night["id"][:8])
+    check(
+        "new book leaves seed alone",
+        [note["title"] for note in new_db.list_notes(False)] == ["第一笺", "今晚这一页"],
+        new_db.list_notes(False),
+    )
 
     plugin.terminate_sync = None
     asyncio.run(plugin.terminate())

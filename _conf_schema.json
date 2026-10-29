@@ -19,7 +19,7 @@
     "hint": "留空就用主 LLM Provider。日记是夜里自己跑的，默认那个要是下线或没额度，那一晚就白等，建议单独选一个稳的。"
   },
   "default_mode": {
-    "description": "AI 写日记时怎么落笔",
+    "description": "你主动让它写日记时怎么落笔",
     "type": "string",
     "default": "append_today",
     "options": [
@@ -30,7 +30,7 @@
       "接到今天那篇后面",
       "另起一篇新的"
     ],
-    "hint": "默认接到今天那篇后面，一天一篇，不会碎成一地。"
+    "hint": "默认接到今天那篇后面，一天一篇，不会碎成一地。定时自动写那一次始终接当天那篇，不受这里影响。"
   },
   "diary_template": {
     "description": "新日记的模板",

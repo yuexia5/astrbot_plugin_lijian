@@ -136,7 +136,7 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 今天做了什么\n\n- \n\n"
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
-PLUGIN_VERSION = "1.5.4"
+PLUGIN_VERSION = "1.5.5"
 
 
 @register(
@@ -202,7 +202,10 @@ class LijianPlugin(Star):
                         "试着对 AI 说「把今天的总结写进日记」，或打开 WebUI 里的书架页面。"
                     ),
                     "kind": "diary",
-                    "diary_date": local_today(),
+                    # 日期留空：这一篇只是欢迎语，不是当天的日记。
+                    # 填了今天，安装当天 23:00 的自动写会把它当成「今天已经写过」，
+                    # 正文接在欢迎语后面，标题也一直是「第一笺」。
+                    "diary_date": None,
                     "tags": ["璃笺"],
                     "source": "local",
                 }
