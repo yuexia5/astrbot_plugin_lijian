@@ -18,6 +18,20 @@
     "_special": "select_provider",
     "hint": "留空就用主 LLM Provider。日记是夜里自己跑的，默认那个要是下线或没额度，那一晚就白等，建议单独选一个稳的。"
   },
+  "auto_write_source": {
+    "description": "日记素材来自哪里",
+    "type": "string",
+    "default": "private",
+    "options": ["private", "group", "both"],
+    "labels": ["私聊", "群聊", "私聊和群聊"],
+    "hint": "默认保持只采集私聊。选群聊后，会记录群友的消息和机器人的回复，不需要每条都 @ 机器人；仅群聊模式没有素材时跳过写作。"
+  },
+  "auto_write_group_ids": {
+    "description": "采集哪些群聊",
+    "type": "list",
+    "default": [],
+    "hint": "填写群号，每行一个，也支持完整群会话 ID；留空采集所有群聊。只在素材来源包含群聊时生效。切换配置前的聊天不会自动补采。"
+  },
   "default_mode": {
     "description": "你主动让它写日记时怎么落笔",
     "type": "string",

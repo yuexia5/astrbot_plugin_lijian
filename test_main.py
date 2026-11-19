@@ -39,17 +39,40 @@ api.AstrBotConfig = AstrBotConfig
 api.logger = _NullLogger()
 astrbot.api = api
 
+class _FakeSP:
+    def __init__(self):
+        self.values = {}
+
+    async def get_async(self, *, key, default=None, **kwargs):
+        return self.values.get(key, default)
+
+
+api.sp = _FakeSP()
+
 event_mod = ModuleType("astrbot.api.event")
 filter_mod = ModuleType("astrbot.api.event.filter")
 
 
 class AstrMessageEvent:
-    def __init__(self, text="", private=True, session="sess-1"):
+    def __init__(
+        self,
+        text="",
+        private=True,
+        session="sess-1",
+        sender_id="user-1",
+        sender_name="群友甲",
+        message_id="",
+    ):
         self.text = text
         self.message_str = text
-        self.unified_msg_origin = f"test:FriendMessage:{session}"
+        kind = "FriendMessage" if private else "GroupMessage"
+        self.unified_msg_origin = f"test:{kind}:{session}"
         self._private = private
         self._session = session
+        self._sender_id = sender_id
+        self._sender_name = sender_name
+        self.message_obj = type("Message", (), {"message_id": message_id})()
+        self._extras = {}
 
     def plain_result(self, message):
         return message
@@ -59,6 +82,30 @@ class AstrMessageEvent:
 
     def get_session_id(self):
         return self._session
+
+    def get_group_id(self):
+        return "" if self._private else self._session
+
+    def get_sender_id(self):
+        return self._sender_id
+
+    def get_sender_name(self):
+        return self._sender_name
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+
+class EventMessageType:
+    GROUP_MESSAGE = "GroupMessage"
+
+
+class CustomFilter:
+    def __init__(self, **kwargs):
+        pass
 
 
 class _Filter:
@@ -91,11 +138,29 @@ class _Filter:
 
         return decorate
 
+    def event_message_type(self, message_type, priority=0):
+        def decorate(func):
+            func.__message_type__ = message_type
+            return func
+
+        return decorate
+
+    def custom_filter(self, custom_type_filter):
+        def decorate(func):
+            func.__custom_filter__ = custom_type_filter
+            return func
+
+        return decorate
+
 
 filter_mod.command = _Filter().command
 filter_mod.llm_tool = _Filter().llm_tool
 filter_mod.on_llm_request = _Filter().on_llm_request
 filter_mod.on_llm_response = _Filter().on_llm_response
+filter_mod.event_message_type = _Filter().event_message_type
+filter_mod.EventMessageType = EventMessageType
+filter_mod.CustomFilter = CustomFilter
+filter_mod.custom_filter = _Filter().custom_filter
 event_mod.filter = filter_mod
 event_mod.AstrMessageEvent = AstrMessageEvent
 api.event = event_mod
@@ -176,8 +241,10 @@ class FakeCronManager:
 class FakePersonaManager:
     def __init__(self, prompt=""):
         self.prompt = prompt
+        self.umos = []
 
     async def get_default_persona_v3(self, umo=None):
+        self.umos.append(umo)
         return {"name": "测试人格", "prompt": self.prompt}
 
 
@@ -842,6 +909,224 @@ with tempfile.TemporaryDirectory() as tmp:
 
     asyncio.run(run_auto_write())
 
+    async def run_group_materials():
+        original_db = plugin._db
+        plugin._db = plugin_main.Database(memory=True)
+        plugin.config["auto_write_source"] = "group"
+        plugin.config["auto_write_group_ids"] = ["g1"]
+        original_newest = plugin_main.LijianPlugin._newest_live_instance
+        try:
+            plugin_main.LijianPlugin._newest_live_instance = staticmethod(
+                lambda: plugin
+            )
+            short_message = AstrMessageEvent(
+                "嗯",
+                private=False,
+                session="g1",
+                sender_name="名字很长但没有聊天内容的群友",
+                message_id="short",
+            )
+            await plugin.collect_material_on_group_message(short_message)
+            ctx.provider = FakeProvider("不该因为昵称或群号而调用模型。")
+            result = await plugin._compose_diary(manual=True)
+            check(
+                "group metadata does not qualify as diary content",
+                not result["ok"] and not ctx.provider.calls,
+            )
+            plugin._db.material_clear()
+            first = AstrMessageEvent(
+                "下午一起讨论街霸的角色。",
+                private=False,
+                session="g1",
+                sender_name="小明",
+                message_id="m1",
+            )
+            passive_filter = plugin_main._GroupMaterialFilter()
+            passed = passive_filter.filter(first, {})
+            check("passive group collection does not activate handler", passed is False)
+            await asyncio.gather(*plugin._material_tasks)
+            check(
+                "group captures without llm request", plugin._db.material_pending() == 1
+            )
+            await plugin.collect_material_on_request(first, ProviderRequest())
+            check(
+                "group listener and request do not duplicate",
+                plugin._db.material_pending() == 1,
+            )
+            second = AstrMessageEvent(
+                first.message_str,
+                private=False,
+                session="g1",
+                sender_id="user-2",
+                sender_name="小红",
+                message_id="m2",
+            )
+            await plugin.collect_material_on_group_message(second)
+            check(
+                "group keeps identical words from different senders",
+                plugin._db.material_pending() == 2,
+            )
+            redelivery = AstrMessageEvent(
+                first.message_str,
+                private=False,
+                session="g1",
+                sender_name="小明",
+                message_id="m1",
+            )
+            await plugin.collect_material_on_group_message(redelivery)
+            check(
+                "group dedupes redelivery by message id",
+                plugin._db.material_pending() == 2,
+            )
+            check(
+                "duplicate material does not leave a write transaction open",
+                not plugin._db.conn.in_transaction,
+            )
+            outside = AstrMessageEvent("其他群的秘密", private=False, session="g2")
+            await plugin.collect_material_on_group_message(outside)
+            await plugin.collect_material_on_response(
+                outside, type("R", (), {"completion_text": "其他群的回复"})()
+            )
+            check(
+                "group allowlist excludes messages and replies",
+                plugin._db.material_pending() == 2,
+            )
+            private = AstrMessageEvent("私聊内容不能混进这篇群日记。")
+            await plugin.collect_material_on_request(private, ProviderRequest())
+            await plugin.collect_material_on_response(
+                private, type("R", (), {"completion_text": "私聊回复"})()
+            )
+            check(
+                "group-only collection excludes private chat",
+                plugin._db.material_pending() == 2,
+            )
+            await plugin.collect_material_on_response(
+                first, type("R", (), {"completion_text": "我也加入了讨论。"})()
+            )
+            plugin._db.material_append(
+                "test:FriendMessage:old", "user", "以前私聊的旧素材"
+            )
+            provider = FakeProvider(
+                "# 群里的角色讨论\n\n我看见小明和小红聊了街霸。\n\n标签：街霸、讨论"
+            )
+            ctx.provider = provider
+            ctx.persona_manager = FakePersonaManager("你是群里的白薇。")
+            result = await plugin._compose_diary(manual=True)
+            check("group diary composed", result.get("ok") is True)
+            check(
+                "group diary has generated title",
+                result["note"]["title"] == "群里的角色讨论",
+            )
+            check(
+                "diary heading stored separately from body",
+                not result["note"]["body_md"].startswith("#"),
+            )
+            prompt = provider.calls[-1]["prompt"]
+            check(
+                "group prompt preserves speakers and bot",
+                all(text in prompt for text in ("小明：", "小红：", "我：我也加入")),
+            )
+            check(
+                "group prompt excludes old private material",
+                "以前私聊的旧素材" not in prompt,
+            )
+            check(
+                "group persona uses selected group origin",
+                ctx.persona_manager.umos[-1] == first.unified_msg_origin,
+            )
+            check(
+                "selected pending count excludes private leftovers",
+                plugin._db.material_pending("group", ["g1"]) == 0,
+            )
+            check(
+                "excluded private rows remain available",
+                plugin._db.material_pending("private") == 1,
+            )
+            before = len(provider.calls)
+            result = await plugin._compose_diary(manual=True)
+            check(
+                "empty group pool skips quiet-day fiction",
+                not result["ok"] and len(provider.calls) == before,
+            )
+            plugin.config["auto_write_source"] = "both"
+            await plugin.collect_material_on_request(private, ProviderRequest())
+            third = AstrMessageEvent(
+                "晚上的新群消息", private=False, session="g1", message_id="m3"
+            )
+            await plugin.collect_material_on_group_message(third)
+            plugin._db.material_append(
+                "test:GroupMessage:g2", "user", "不在白名单的旧群素材"
+            )
+            digest, count, _ = plugin._db.material_digest(
+                plugin._db.material_cursor(), 8000, "both", ["g1"]
+            )
+            check(
+                "both mode includes selected group and private chat",
+                "[私聊]" in digest and "晚上的新群消息" in digest and count == 3,
+            )
+            check(
+                "selection filters old rows outside group allowlist",
+                "不在白名单的旧群素材" not in digest,
+            )
+            plugin.config["auto_write_group_ids"] = [first.unified_msg_origin]
+            check("group allowlist accepts full origin", plugin._accept_material(third))
+            blocked = AstrMessageEvent(
+                "全局白名单外不采集", private=False, session="g1", message_id="blocked"
+            )
+            passive_filter.filter(
+                blocked,
+                {
+                    "platform_settings": {
+                        "enable_id_white_list": True,
+                        "id_whitelist": ["g2"],
+                    }
+                },
+            )
+            check(
+                "passive capture respects global group whitelist",
+                not plugin._material_tasks,
+            )
+            before = plugin._db.material_pending()
+            api.sp.values["session_service_config"] = {"session_enabled": False}
+            await plugin.collect_material_on_group_message(blocked)
+            check(
+                "passive capture respects session shutdown",
+                plugin._db.material_pending() == before,
+            )
+            api.sp.values.clear()
+            api.sp.values["session_plugin_config"] = {
+                blocked.unified_msg_origin: {
+                    "disabled_plugins": [plugin_main.PLUGIN_NAME]
+                }
+            }
+            await plugin.collect_material_on_group_message(blocked)
+            check(
+                "passive capture respects disabled session plugin",
+                plugin._db.material_pending() == before,
+            )
+            api.sp.values.clear()
+            plugin.config["auto_write_enabled"] = False
+            before = plugin._db.material_pending()
+            await plugin.collect_material_on_group_message(
+                AstrMessageEvent("关掉后不采集", private=False, session="g1")
+            )
+            check(
+                "disabled auto writer stops group collection",
+                plugin._db.material_pending() == before,
+            )
+        finally:
+            plugin_main.LijianPlugin._newest_live_instance = staticmethod(
+                original_newest
+            )
+            api.sp.values.clear()
+            plugin._db.close()
+            plugin._db = original_db
+            plugin.config["auto_write_enabled"] = True
+            plugin.config.pop("auto_write_source", None)
+            plugin.config.pop("auto_write_group_ids", None)
+
+    asyncio.run(run_group_materials())
+
     # ---- 晚间自动写的落点：白天写过就接进去，没写过才起新书 ----
     import db as db_module
 
@@ -863,7 +1148,8 @@ with tempfile.TemporaryDirectory() as tmp:
     day_note = day_db.write_diary_from_ai(
         {"content_md": "白天随手写的，没有标题行。", "mode": "append_today"}
     )
-    check("daytime write without heading falls back", day_note["title"] == db_module.UNTITLED_TITLE)
+    check("daytime prose gets a title", day_note["title"] == "白天随手写的，没有标题行")
+    day_db.update_note(day_note["id"], {"title": db_module.UNTITLED_TITLE})
     night_note = day_db.write_diary_from_ai(
         {"content_md": "**今晚这一页**\n\n晚上自动写的。", "mode": "append_today"}
     )
@@ -908,13 +1194,19 @@ with tempfile.TemporaryDirectory() as tmp:
     )
 
     new_db = _fresh_db("write-new")
+    seed_note = new_db.list_notes(False)[0]
     only_night = new_db.write_diary_from_ai(
         {"content_md": "**今晚这一页**\n\n晚上自动写的。", "mode": "append_today"}
     )
-    check("quiet daytime starts a new book", only_night["id"] != "", only_night["id"][:8])
+    check(
+        "quiet daytime starts a new book",
+        only_night["id"] != seed_note["id"],
+        only_night["id"][:8],
+    )
     check(
         "new book leaves seed alone",
-        [note["title"] for note in new_db.list_notes(False)] == ["第一笺", "今晚这一页"],
+        new_db.get_note(seed_note["id"]) == seed_note
+        and len(new_db.list_notes(False)) == 2,
         new_db.list_notes(False),
     )
 

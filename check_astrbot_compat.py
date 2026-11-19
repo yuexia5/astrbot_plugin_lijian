@@ -35,18 +35,25 @@ def isolated_cwd():
     会在仓库中建出 data/cmd_config.json、data/t2i_templates/ 这些运行时产物。
     """
     previous = Path.cwd()
+    previous_root = os.environ.get("ASTRBOT_ROOT")
     with tempfile.TemporaryDirectory(prefix="lijian-compat-") as tmp:
         os.chdir(tmp)
+        os.environ["ASTRBOT_ROOT"] = tmp
         try:
             yield
         finally:
             os.chdir(previous)
+            if previous_root is None:
+                os.environ.pop("ASTRBOT_ROOT", None)
+            else:
+                os.environ["ASTRBOT_ROOT"] = previous_root
 
 
 def ensure_astrbot_importable() -> None:
     """AstrBot 常常是源码目录而不是装进 venv 的包，这里把根目录补进 sys.path。
 
-    优先级：已经在路径里 → 环境变量 ASTRBOT_ROOT → 逐层往上找含 astrbot/__init__.py 的目录。
+    Source lookup uses ASTRBOT_SOURCE_ROOT, then the legacy ASTRBOT_ROOT hint,
+    then parent directories containing the AstrBot package.
     """
     try:
         import astrbot  # noqa: F401
@@ -56,7 +63,7 @@ def ensure_astrbot_importable() -> None:
         pass
 
     candidates: list[Path] = []
-    env_root = os.environ.get("ASTRBOT_ROOT")
+    env_root = os.environ.get("ASTRBOT_SOURCE_ROOT") or os.environ.get("ASTRBOT_ROOT")
     if env_root:
         candidates.append(Path(env_root).expanduser())
     candidates.extend(PLUGIN_DIR.parents)
@@ -130,7 +137,7 @@ def main() -> int:
     except ImportError as exc:
         fatal(
             "导入 astrbot",
-            f"{exc}。用 AstrBot 的 venv 跑，或设 ASTRBOT_ROOT 指向 AstrBot 源码目录",
+            f"{exc}。用 AstrBot 的 venv 跑，或设 ASTRBOT_SOURCE_ROOT 指向 AstrBot 源码目录",
         )
 
     version = getattr(astrbot, "__version__", "未知")
@@ -145,15 +152,37 @@ def main() -> int:
 
     try:
         from astrbot.api.event import AstrMessageEvent, filter
+
         check(True, "astrbot.api.event")
+        check(
+            all(
+                hasattr(AstrMessageEvent, name)
+                for name in (
+                    "get_group_id",
+                    "get_sender_id",
+                    "get_sender_name",
+                    "get_extra",
+                    "set_extra",
+                )
+            ),
+            "群聊素材依赖的事件方法",
+        )
         check(hasattr(filter, "command"), "filter.command")
         check(hasattr(filter, "llm_tool"), "filter.llm_tool")
+        check(hasattr(filter, "CustomFilter"), "filter.CustomFilter")
+        check(hasattr(filter, "custom_filter"), "filter.custom_filter")
     except ImportError as exc:
         fatal("astrbot.api.event", str(exc))
 
     try:
         import astrbot.api.web as web_api
-        for symbol in ("json_response", "error_response", "request", "PluginUploadFile"):
+
+        for symbol in (
+            "json_response",
+            "error_response",
+            "request",
+            "PluginUploadFile",
+        ):
             check(hasattr(web_api, symbol), f"web.{symbol}")
     except ImportError as exc:
         fatal("astrbot.api.web", str(exc))
@@ -290,7 +319,9 @@ def main() -> int:
         schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
         unknown = sorted({meta.get("type") for meta in schema.values() if isinstance(meta, dict)} - set(DEFAULT_VALUE_MAP))
         check(not unknown, "schema 类型受支持", "、".join(unknown) or "全部在 DEFAULT_VALUE_MAP 内")
-        config = AstrBotConfig(schema=schema)
+        config = AstrBotConfig(
+            config_path=str(Path.cwd() / "lijian-test-config.json"), schema=schema
+        )
         missing = [key for key in schema if key not in config]
         check(not missing, "schema 可加载", "、".join(missing) or f"{len(schema)} 项全部就位")
     except Exception as exc:  # noqa: BLE001
@@ -316,5 +347,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    ensure_astrbot_importable()
     with isolated_cwd():
         sys.exit(main())

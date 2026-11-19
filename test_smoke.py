@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+import sqlite3
 import sys
 import tempfile
 from datetime import datetime
@@ -23,6 +24,7 @@ from db import (
     clean_tags,
     local_today,
     markdown_for_note,
+    normalize_diary_title,
     parse_markdown,
     word_count,
 )
@@ -496,12 +498,163 @@ def test_parse_markdown_heading_fallback():
     check("empty fallback", parsed2["title"] == "未命名")
 
 
+def test_diary_titles_and_legacy_materials():
+    """Verify title repair and upgrades from the original material schema."""
+    check(
+        "diary extracts level-two heading",
+        normalize_diary_title(None, "## 闹鬼酒店\n\n正文", "2026-11-19") == "闹鬼酒店",
+    )
+    check(
+        "diary heading preserves a literal hash",
+        normalize_diary_title(None, "## C#\n\n正文", "2026-11-19") == "C#",
+    )
+    check(
+        "diary heading removes closing ATX markers",
+        normalize_diary_title(None, "## 项目回顾 ###\n\n正文", "2026-11-19")
+        == "项目回顾",
+    )
+    check(
+        "diary uses plain opening sentence",
+        normalize_diary_title(None, "熬夜的吐槽\n\n正文", "2026-11-19") == "熬夜的吐槽",
+    )
+    check(
+        "diary preserves explicit title",
+        normalize_diary_title("自己的名字", "# 模型的名字\n\n正文", "2026-11-19")
+        == "自己的名字",
+    )
+    check(
+        "diary uses dated fallback for empty template",
+        normalize_diary_title(None, "**天气**：\n**心情**：", "2026-11-19")
+        == "2026-11-19 日记",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy.sqlite3"
+        legacy = sqlite3.connect(path)
+        legacy.execute(
+            "CREATE TABLE diary_materials (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO diary_materials (session, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (
+                "test:FriendMessage:p1",
+                "user",
+                "升级前的聊天素材",
+                "2026-11-18T12:00:00Z",
+            ),
+        )
+        legacy.commit()
+        legacy.close()
+        db = Database(path)
+        pool = db.material_pool()
+        check(
+            "legacy material content survives migration",
+            len(pool) == 1 and pool[0]["c"] == "升级前的聊天素材",
+        )
+        check(
+            "legacy material has empty speaker metadata",
+            pool[0]["sender_id"] == ""
+            and pool[0]["sender_name"] == ""
+            and pool[0]["message_id"] == "",
+        )
+        old = db.create_note(
+            {
+                "title": "未命名便签",
+                "body_md": "## 旧日记的标题\n\n原来的日记正文。",
+                "kind": "diary",
+                "diary_date": "2026-11-18",
+                "tags": ["旧标签"],
+            }
+        )
+        named = db.create_note(
+            {
+                "title": "用户自己的名字",
+                "body_md": "# 另一个标题\n\n正文",
+                "kind": "diary",
+                "diary_date": "2026-11-17",
+            }
+        )
+        memo = db.create_note(
+            {"title": "未命名便签", "body_md": "便签不自动改名", "kind": "note"}
+        )
+        db.close()
+        db = Database(path)
+        repaired = db.get_note(old["id"])
+        check(
+            "old diary placeholder repaired on startup",
+            repaired["title"] == "旧日记的标题",
+        )
+        check(
+            "title repair preserves diary body and date",
+            repaired["body_md"] == old["body_md"]
+            and repaired["diary_date"] == old["diary_date"]
+            and repaired["tags"] == old["tags"],
+        )
+        check(
+            "title repair preserves custom names",
+            db.get_note(named["id"])["title"] == "用户自己的名字",
+        )
+        check(
+            "title repair leaves notes alone",
+            db.get_note(memo["id"])["title"] == "未命名便签",
+        )
+        db.material_append(
+            "test:GroupMessage:g1-member",
+            "user",
+            "按群友隔离的会话",
+            sender_name="小明",
+            group_id="g1",
+            message_id="m1",
+        )
+        check(
+            "allowlist handles member-isolated origins",
+            len(db.material_pool(source="group", group_ids=["g1"])) == 1,
+        )
+        db.close()
+        db = Database(path)
+        check(
+            "schema upgrade and title repair are idempotent",
+            db.get_note(old["id"])["body_md"] == old["body_md"]
+            and len(db.material_pool()) == 2,
+        )
+        for message_id in ("m1", "m2"):
+            db.material_append(
+                "test:GroupMessage:g-budget",
+                "user",
+                "1234567890",
+                sender_name="小明",
+                message_id=message_id,
+            )
+        digest, count, last_id = db.material_digest(0, 39, "group", ["g-budget"])
+        check(
+            "group digest budget includes separators", len(digest) <= 39 and count == 1
+        )
+        remaining, count, _ = db.material_digest(last_id, 39, "group", ["g-budget"])
+        check(
+            "bounded digest leaves remaining messages for next write",
+            count == 1 and "1234567890" in remaining,
+        )
+        digest, count, _ = db.material_digest(0, 8000, "group", ["g-budget"])
+        check(
+            "consecutive messages share one group header",
+            count == 2 and digest.count("[群 g-budget]") == 1,
+        )
+        db.material_append("test:GroupMessage:g-other", "user", "另一个群的消息")
+        db.material_append("test:GroupMessage:g-budget", "user", "又回到原来的群")
+        digest, _, _ = db.material_digest(0, 8000, "group")
+        check(
+            "interleaved groups retain scope boundaries",
+            digest.count("[群 g-budget]") == 2 and "[群 g-other]" in digest,
+        )
+        db.close()
+
+
 if __name__ == "__main__":
     print("== markdown 解析 ==")
     test_parse_markdown()
     test_parse_markdown_heading_fallback()
     print("== 数据库 ==")
     test_database()
+    test_diary_titles_and_legacy_materials()
     print("== 新功能 ==")
     test_new_features()
     print("== 那年今天与连续天数 ==")

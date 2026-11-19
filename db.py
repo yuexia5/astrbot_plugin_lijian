@@ -65,7 +65,11 @@ CREATE TABLE IF NOT EXISTS diary_materials (
     session TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL,
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    sender_id TEXT NOT NULL DEFAULT '',
+    sender_name TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    group_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_materials_created ON diary_materials(created_at);
@@ -173,6 +177,34 @@ class Database:
     def migrate(self) -> None:
         with self._lock:
             self.conn.executescript(SCHEMA)
+            columns = {
+                row["name"]
+                for row in self.conn.execute("PRAGMA table_info(diary_materials)")
+            }
+            for name in ("sender_id", "sender_name", "message_id", "group_id"):
+                if name not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE diary_materials ADD COLUMN {name} "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_materials_message "
+                "ON diary_materials(session, role, message_id) WHERE message_id != ''"
+            )
+            # Repair only generated placeholders; preserve existing names and bodies.
+            for row in self.conn.execute(
+                "SELECT id, body_md, diary_date FROM notes "
+                "WHERE kind = 'diary' AND title = ?",
+                (UNTITLED_TITLE,),
+            ).fetchall():
+                self.conn.execute(
+                    "UPDATE notes SET title = ?, updated_at = ? WHERE id = ?",
+                    (
+                        normalize_diary_title(None, row["body_md"], row["diary_date"]),
+                        now(),
+                        row["id"],
+                    ),
+                )
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value_json) VALUES ('theme', ?)",
                 (json.dumps("light"),),
@@ -704,16 +736,14 @@ class Database:
                 existing = self._find_diary_by_date(diary_date)
                 if existing is not None:
                     title = input_.get("title") or existing["title"]
+                    if title == UNTITLED_TITLE:
+                        title = normalize_diary_title(None, content_md, diary_date)
                     # 模型偶尔会把书名当正文第一行再写一遍，接进来之前先削掉。
                     content_md = strip_repeated_title(content_md, title)
                     separator = "" if not existing["body_md"].strip() else "\n\n"
                     # 一天写两次以上时，中间插一行落笔时间，免得两段混成一段。
                     piece = f"{local_stamp()}\n\n{content_md}"
                     merged = f"{existing['body_md']}{separator}{piece}"
-                    # 白天那篇没抽出标题、挂着兜底名的，接上新内容后再抽一次。
-                    # 已经有真标题的不动，免得把用户自己起的名盖掉。
-                    if title == UNTITLED_TITLE:
-                        title = normalize_title(None, merged)
                     updated = self.update_note(
                         existing["id"],
                         {
@@ -730,7 +760,7 @@ class Database:
                     )
                     self._record_write_event(updated["id"], "astrbot", input_)
                     return updated
-            title = normalize_title(input_.get("title"), content_md)
+            title = normalize_diary_title(input_.get("title"), content_md, diary_date)
             note = self.create_note(
                 {
                     "title": title,
@@ -888,25 +918,62 @@ class Database:
     MATERIAL_ITEM_CHARS = 600
     CURSOR_KEY = "material_cursor"
 
-    def material_append(self, session: str, role: str, content: str) -> bool:
+    def material_append(
+        self,
+        session: str,
+        role: str,
+        content: str,
+        *,
+        sender_id: str = "",
+        sender_name: str = "",
+        message_id: str = "",
+        group_id: str = "",
+        created_at: str = "",
+    ) -> bool:
         """记一条素材。返回是否真的记下了（空的、跟上一条重复的会丢掉）。"""
         text = " ".join(str(content or "").split()).strip()
         if not text:
             return False
         if len(text) > self.MATERIAL_ITEM_CHARS:
             text = text[: self.MATERIAL_ITEM_CHARS] + "…"
+        session = str(session or "")
+        sender_id = str(sender_id or "")
+        sender_name = " ".join(str(sender_name or "").split())[:80]
+        message_id = str(message_id or "")
         with self._lock:
             # 工具调用会让同一个钩子跑好几轮，同一句话别记第二遍
             last = self.conn.execute(
-                "SELECT role, content FROM diary_materials ORDER BY id DESC LIMIT 1"
+                "SELECT session, role, content, sender_id, sender_name "
+                "FROM diary_materials ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            if last is not None and last["role"] == role and last["content"] == text:
+            if (
+                not message_id
+                and last is not None
+                and last["session"] == session
+                and last["role"] == role
+                and last["content"] == text
+                and last["sender_id"] == sender_id
+                and last["sender_name"] == sender_name
+            ):
                 return False
-            self.conn.execute(
-                "INSERT INTO diary_materials (session, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (str(session or ""), role, text, now()),
+            inserted = self.conn.execute(
+                "INSERT OR IGNORE INTO diary_materials "
+                "(session, role, content, created_at, sender_id, sender_name, message_id, group_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session,
+                    role,
+                    text,
+                    created_at or now(),
+                    sender_id,
+                    sender_name,
+                    message_id,
+                    str(group_id or ""),
+                ),
             )
+            if not inserted.rowcount:
+                self._persist()
+                return False
             # 只留最近 MATERIAL_MAX_ITEMS 条，超出的当场删掉，别让表无限长
             self.conn.execute(
                 "DELETE FROM diary_materials WHERE id NOT IN ("
@@ -934,9 +1001,14 @@ class Database:
         except Exception:  # noqa: BLE001
             pass
 
-    def material_pool(self, after_id: int = 0) -> list[dict[str, Any]]:
+    def material_pool(
+        self,
+        after_id: int = 0,
+        source: str = "both",
+        group_ids: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
         """按时间正序取还没写进日记的素材。字段名保持 t/s/r/c，另带 id。"""
-        sql = "SELECT id, session, role, content, created_at FROM diary_materials"
+        sql = "SELECT * FROM diary_materials"
         params: tuple[Any, ...] = ()
         if after_id:
             sql += " WHERE id > ?"
@@ -944,58 +1016,97 @@ class Database:
         sql += " ORDER BY id ASC"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
-        return [
-            {
-                "id": row["id"],
-                "t": row["created_at"],
-                "s": row["session"],
-                "r": row["role"],
-                "c": row["content"],
-            }
-            for row in rows
-        ]
+        items = []
+        groups = set(group_ids or [])
+        for row in rows:
+            group_id = row["group_id"]
+            if not group_id and ":GroupMessage:" in row["session"]:
+                group_id = row["session"].split(":GroupMessage:", 1)[1]
+            is_group = bool(group_id)
+            if source == "private" and is_group:
+                continue
+            if source == "group" and not is_group:
+                continue
+            if is_group and groups:
+                if group_id not in groups and row["session"] not in groups:
+                    continue
+            items.append(
+                {
+                    "id": row["id"],
+                    "t": row["created_at"],
+                    "s": row["session"],
+                    "r": row["role"],
+                    "c": row["content"],
+                    "sender_id": row["sender_id"],
+                    "sender_name": row["sender_name"],
+                    "message_id": row["message_id"],
+                    "group_id": group_id,
+                }
+            )
+        return items
 
-    def last_material_session(self) -> str:
+    def last_material_session(
+        self, source: str = "both", group_ids: Optional[list[str]] = None
+    ) -> str:
         """最近一条素材来自哪个会话。
 
         这一次没有新素材时（游标已经推到最新），也要知道该跟着谁的主模型写，
         否则会退到全局默认那个 provider，那里常常是个早就下线的模型。
         """
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT session FROM diary_materials ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        return str(row["session"] or "") if row is not None else ""
+        pool = self.material_pool(source=source, group_ids=group_ids)
+        return pool[-1]["s"] if pool else ""
 
-    def material_pending(self) -> int:
+    def material_pending(
+        self, source: str = "both", group_ids: Optional[list[str]] = None
+    ) -> int:
         """还有多少条没被写进日记。状态指令用它报数。"""
-        cursor = self.material_cursor()
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM diary_materials WHERE id > ?", (cursor,)
-            ).fetchone()
-        return int(row["n"]) if row is not None else 0
+        return len(self.material_pool(self.material_cursor(), source, group_ids))
 
     def material_digest(
-        self, after_id: int = 0, max_chars: int = 8000
+        self,
+        after_id: int = 0,
+        max_chars: int = 8000,
+        source: str = "both",
+        group_ids: Optional[list[str]] = None,
     ) -> tuple[str, int, int]:
         """把没写进日记的素材拼成对话记录。
 
         返回 (文本, 条数, 消费到的 id)。从最早一条往后装，装满就停——
         一次塞不完的下次接着塞，不会为了照顾最新的而漏掉中间那段。
         """
-        pool = self.material_pool(after_id)
+        pool = self.material_pool(after_id, source, group_ids)
         lines: list[str] = []
         used = 0
         last_id = int(after_id)
+        max_chars = max(1, int(max_chars))
+        last_scope = None
         for item in pool:
-            who = "对方" if item.get("r") == "user" else "我"
-            line = f"{who}：{item.get('c', '')}"
-            if lines and used + len(line) > max_chars:
+            is_group = bool(item["group_id"])
+            who = "我"
+            if item.get("r") == "user":
+                who = (
+                    item.get("sender_name") or item.get("sender_id") or "群友"
+                    if is_group
+                    else "对方"
+                )
+            scope_key = ("group", item["group_id"]) if is_group else ("private", "")
+            scope = ""
+            if scope_key != last_scope:
+                if is_group:
+                    scope = f"[群 {item['group_id']}]\n"
+                elif source == "both":
+                    scope = "[私聊]\n"
+            line = f"{scope}{who}：{item.get('c', '')}"
+            line_chars = len(line) + (1 if lines else 0)
+            if lines and used + line_chars > max_chars:
                 break
+            if not lines and len(line) > max_chars:
+                line = line[:max_chars]
+                line_chars = len(line)
             lines.append(line)
-            used += len(line)
+            used += line_chars
             last_id = int(item.get("id") or last_id)
+            last_scope = scope_key
         return "\n".join(lines), len(lines), last_id
 
     def material_clear(self) -> int:
@@ -1118,12 +1229,40 @@ def normalize_title(title: Any, body: str) -> str:
     return first_markdown_heading(body) or UNTITLED_TITLE
 
 
+def normalize_diary_title(title: Any, body: str, diary_date: Optional[str]) -> str:
+    """Choose a diary title even when the model returns only prose.
+
+    Args:
+        title: Explicit title, if supplied.
+        body: Diary Markdown.
+        diary_date: Date used as a last resort for empty/template-only bodies.
+
+    Returns:
+        An explicit title, heading, short opening sentence, or dated default.
+    """
+    selected = normalize_title(title if title != UNTITLED_TITLE else None, body)
+    if selected != UNTITLED_TITLE:
+        return selected
+    for line in body.splitlines():
+        text = line.strip()
+        if not text or text.startswith(("```", "---", "——", "标签：", "tags:")):
+            continue
+        text = re.sub(r"[*_`#]", "", text).strip()
+        if re.match(r"^(?:天气|心情|日期)\s*[：:]", text):
+            continue
+        text = re.split(r"[。！？!?]", text, maxsplit=1)[0].strip()
+        if text:
+            return text if len(text) <= 28 else text[:27] + "…"
+    return f"{diary_date or local_today()} 日记"
+
+
 def first_markdown_heading(body: str) -> Optional[str]:
     # 先找「# 标题」，这一种全文扫：用户可能先写正文再补标题
     for line in body.splitlines():
         stripped = line.strip()
-        if stripped.startswith("# "):
-            value = stripped[2:].strip()
+        matched = _ATX_HEADING.match(stripped)
+        if matched:
+            value = re.sub(r"\s+#+\s*$", "", matched.group("text")).strip()
             if value:
                 return value
     # 再找整行只有加粗的那种，模型爱这么写小标题（**差点卡住的那颗糖**）

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
@@ -38,8 +38,10 @@ try:
         date_prefix,
         local_today,
         markdown_for_note,
+        normalize_diary_title,
         normalize_kind,
         safe_filename,
+        strip_repeated_title,
     )
     from .server import BridgeServer
 except ImportError:
@@ -50,8 +52,10 @@ except ImportError:
         date_prefix,
         local_today,
         markdown_for_note,
+        normalize_diary_title,
         normalize_kind,
         safe_filename,
+        strip_repeated_title,
     )
     from server import BridgeServer
 
@@ -122,7 +126,7 @@ AUTO_WRITE_SYSTEM = (
     "- 不写「作为一个 AI」「希望对你有帮助」这种助手腔，也不要说教。\n"
     "- 情绪靠动作和反应写出来，别直接贴「我很开心」这种标签。\n"
     "- 句子可以短，可以断，可以留一句没头没尾的话。人写日记不讲究结构。\n"
-    "- 直接给正文。不要代码块，不要「这是日记」的开场，不要「亲爱的日记」。"
+    "- 只给日记内容，标题按后面的要求写。不要代码块，不要「这是日记」的开场，不要「亲爱的日记」。"
 )
 
 # 备份文件是 gzip 过的 JSON，恢复时按魔数判断，不靠扩展名。
@@ -137,6 +141,50 @@ DEFAULT_DIARY_TEMPLATE = (
     "## 三件小事\n\n1. \n2. \n3. \n"
 )
 PLUGIN_VERSION = "1.5.8"
+
+
+class _GroupMaterialFilter(filter.CustomFilter):
+    """Schedule group capture while leaving the message wake state unchanged."""
+
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        """Collect eligible group events without activating a message handler.
+
+        Args:
+            event: Incoming chat event.
+            cfg: AstrBot configuration for this session.
+
+        Returns:
+            False, so passive collection never wakes the LLM pipeline.
+        """
+        plugin = LijianPlugin._newest_live_instance()
+        if (
+            plugin is None
+            or event.is_private_chat()
+            or not plugin._accept_material(event)
+        ):
+            return False
+        platform_settings = cfg.get("platform_settings", {})
+        if platform_settings.get("enable_id_white_list", False):
+            whitelist = {
+                str(item) for item in platform_settings.get("id_whitelist", [])
+            }
+            admin_exempt = (
+                platform_settings.get("wl_ignore_admin_on_group", False)
+                and getattr(event, "role", "") == "admin"
+            )
+            if (
+                whitelist
+                and not admin_exempt
+                and (
+                    str(event.get_group_id()) not in whitelist
+                    and event.unified_msg_origin not in whitelist
+                )
+            ):
+                return False
+        task = asyncio.create_task(plugin.collect_material_on_group_message(event))
+        plugin._material_tasks.add(task)
+        task.add_done_callback(plugin._material_tasks.discard)
+        return False
 
 
 @register(
@@ -157,6 +205,7 @@ class LijianPlugin(Star):
         self._db: Database | None = None
         self._bridge: BridgeServer | None = None
         self._backup_task: asyncio.Task | None = None
+        self._material_tasks: set[asyncio.Task] = set()
         self._data_dir = self._resolve_data_dir()
         try:
             self._open_database()
@@ -210,6 +259,9 @@ class LijianPlugin(Star):
         return newest
 
     def _release_own_resources(self) -> None:
+        for task in tuple(self._material_tasks):
+            task.cancel()
+        self._material_tasks.clear()
         try:
             self._stop_backup_service()
         except Exception:  # noqa: BLE001
@@ -347,7 +399,7 @@ class LijianPlugin(Star):
                 cron_expression=f"{minute} {hour} * * *",
                 handler=self._auto_write_tick,
                 description=(
-                    "把今天私聊里聊过、还没写进日记的话交给模型，按当前人格的口吻写成一篇。"
+                    "把选定聊天来源里还没写进日记的话交给模型，按当前人格的口吻写成一篇。"
                     "今天已经写过就跳过；今天没怎么聊、距上一篇还不到两天也跳过，"
                     "这两种情况都不调模型；冷场久了补一篇安静的。"
                 ),
@@ -358,14 +410,100 @@ class LijianPlugin(Star):
             return
         logger.info(f"璃笺自动写日记已排程：每天 {self._hhmm(hour, minute)}")
 
+    def _material_options(self) -> tuple[str, list[str]]:
+        """Read the selected material source and group allowlist.
+
+        Returns:
+            Source mode and group IDs (or full group session origins).
+        """
+        source = str(self.config.get("auto_write_source", "private") or "private")
+        if source not in ("private", "group", "both"):
+            source = "private"
+        groups = clean_tags(self.config.get("auto_write_group_ids") or [])
+        return source, groups
+
+    def _accept_material(self, event: AstrMessageEvent) -> bool:
+        """Check whether an event belongs to the configured material sources.
+
+        Args:
+            event: Incoming chat event.
+
+        Returns:
+            Whether the event is eligible for collection.
+        """
+        if not self._auto_write_enabled() or self._live_db() is None:
+            return False
+        source, groups = self._material_options()
+        if event.is_private_chat():
+            return source in ("private", "both")
+        if source not in ("group", "both"):
+            return False
+        return (
+            not groups
+            or str(event.get_group_id()) in groups
+            or event.unified_msg_origin in groups
+        )
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=100)
+    @filter.custom_filter(_GroupMaterialFilter)
+    async def collect_material_on_group_message(self, event: AstrMessageEvent):
+        """Collect group messages even when they do not trigger an LLM reply.
+
+        Args:
+            event: Incoming group event.
+        """
+        if event.is_private_chat() or not self._accept_material(event):
+            return
+        if event.get_extra("lijian_material_collected", False):
+            return
+        text = str(getattr(event, "message_str", "") or "").strip()
+        if not text:
+            return
+        try:
+            # Passive filters run before the normal session shutdown checks.
+            services = await sp.get_async(
+                scope="umo",
+                scope_id=event.unified_msg_origin,
+                key="session_service_config",
+                default={},
+            )
+            if isinstance(services, dict) and services.get("session_enabled") is False:
+                return
+            session_plugins = await sp.get_async(
+                scope="umo",
+                scope_id=event.unified_msg_origin,
+                key="session_plugin_config",
+                default={},
+            )
+            if isinstance(session_plugins, dict):
+                session_config = session_plugins.get(event.unified_msg_origin, {})
+                if isinstance(
+                    session_config, dict
+                ) and PLUGIN_NAME in session_config.get("disabled_plugins", []):
+                    return
+            await asyncio.to_thread(
+                self._live_db().material_append,
+                event.unified_msg_origin,
+                "user",
+                text,
+                sender_id=event.get_sender_id(),
+                sender_name=event.get_sender_name(),
+                message_id=str(getattr(event.message_obj, "message_id", "") or ""),
+                group_id=event.get_group_id(),
+            )
+            event.set_extra("lijian_material_collected", True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Lijian could not collect group material: {exc}")
+
     @filter.on_llm_request()
     async def collect_material_on_request(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
         """聊天时顺手把对方的话记进素材池。"""
-        if not self._auto_write_enabled() or self._live_db() is None:
+        if not self._accept_material(event):
             return
         if not event.is_private_chat():
+            await self.collect_material_on_group_message(event)
             return
         text = str(getattr(event, "message_str", "") or "").strip()
         if not text:
@@ -382,16 +520,18 @@ class LijianPlugin(Star):
         self, event: AstrMessageEvent, response: Any
     ):
         """把自己说的话也记进去，写日记时才知道当时怎么应的。"""
-        if not self._auto_write_enabled() or self._live_db() is None:
-            return
-        if not event.is_private_chat():
+        if not self._accept_material(event):
             return
         text = str(getattr(response, "completion_text", "") or "").strip()
         if not text:
             return
         try:
             await asyncio.to_thread(
-                self._live_db().material_append, event.unified_msg_origin, "assistant", text
+                self._live_db().material_append,
+                event.unified_msg_origin,
+                "assistant",
+                text,
+                group_id="" if event.is_private_chat() else event.get_group_id(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺记录聊天素材失败: {exc}")
@@ -535,10 +675,18 @@ class LijianPlugin(Star):
         if not manual and self._auto_write_done_today():
             logger.info("璃笺自动写日记：今天已经写过了，跳过")
             return {"ok": False, "message": "今天已经写过了"}
+        source, groups = self._material_options()
         try:
             cursor = await asyncio.to_thread(self._live_db().material_cursor)
             digest, count, last_id = await asyncio.to_thread(
-                self._live_db().material_digest, cursor, AUTO_MATERIAL_MAX_CHARS
+                self._live_db().material_digest,
+                cursor,
+                AUTO_MATERIAL_MAX_CHARS,
+                source,
+                groups,
+            )
+            pool = await asyncio.to_thread(
+                self._live_db().material_pool, cursor, source, groups
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"璃笺读取聊天素材失败: {exc}")
@@ -546,11 +694,21 @@ class LijianPlugin(Star):
 
         # 有话说就写，一句也算。没话也不等于没得写——「他今天没来」本身就是日记。
         # 但天天写这个就成了念经，所以冷场要隔几天才补一篇。
+        material_chars = (
+            len(digest)
+            if source == "private"
+            else sum(len(item["c"]) for item in pool if item["id"] <= last_id)
+        )
         has_material = (
-            count >= AUTO_MIN_MATERIAL and len(digest) >= AUTO_MIN_MATERIAL_CHARS
+            count >= AUTO_MIN_MATERIAL and material_chars >= AUTO_MIN_MATERIAL_CHARS
         )
         idle_days = 0
         if not has_material:
+            if source == "group":
+                return {
+                    "ok": False,
+                    "message": "选定群聊还没有可用的聊天素材，先不写。",
+                }
             idle_days = await asyncio.to_thread(self._days_since_last_diary)
             if not manual:
                 if idle_days < AUTO_IDLE_GAP_DAYS:
@@ -568,13 +726,16 @@ class LijianPlugin(Star):
         # 用哪个会话的 umo 取人格：素材里最后说话的那个；没素材就用默认人格。
         session = ""
         try:
-            pool = await asyncio.to_thread(self._live_db().material_pool, cursor)
-            if pool:
-                session = str(pool[-1].get("s") or "")
+            for item in pool:
+                if item["id"] == last_id:
+                    session = str(item.get("s") or "")
+                    break
             if not session:
                 # 这一次没有新素材也要有个会话可用：跟着最近聊过的那条走，
                 # 不然会退到全局默认的 provider——那里可能躺着一个早就下线的模型。
-                session = await asyncio.to_thread(self._live_db().last_material_session)
+                session = await asyncio.to_thread(
+                    self._live_db().last_material_session, source, groups
+                )
         except Exception:  # noqa: BLE001
             pass
         persona = await self._persona_prompt(session)
@@ -601,13 +762,26 @@ class LijianPlugin(Star):
             "写这篇里真的出现过的东西或心情，具体一点（糖、加班、雨夜），"
             "别写「日记」「日常」这种空泛词"
         )
+        title_hint = (
+            "\n- 第一行用「# 标题」写一个具体的短标题（五到十五字），取自这次素材，"
+            "不要只写日期或「今日日记」；空一行后写正文"
+            if not continued
+            else ""
+        )
+        group_hint = (
+            "\n- 群聊素材里的名字是不同的群友，「我」是你的回复。"
+            "保留谁说了什么，不要把所有人的话当成同一个人说的；"
+            "群友之间的对话是你在群里看到的事，不要编成你亲自参与的对话"
+            if any(item["group_id"] for item in pool)
+            else ""
+        )
         if has_material:
-            if len(digest) >= AUTO_RICH_MATERIAL_CHARS:
+            if material_chars >= AUTO_RICH_MATERIAL_CHARS:
                 length_hint = "三百到六百字"
             else:
                 length_hint = "一百五十到三百字，今天话不多，别硬撑，写真正记住的就行"
             prompt = (
-                f"今天是 {today}。以下是今天我和对方聊过的话，按时间顺序：\n\n"
+                f"今天是 {today}。以下是选定聊天来源里还没写进日记的记录，按时间顺序：\n\n"
                 f"{digest}\n\n"
                 "把今天写成一篇日记。\n"
                 "- 挑真正记住的那几个片段写，别逐句复述对话\n"
@@ -615,6 +789,8 @@ class LijianPlugin(Star):
                 "- 对方说过的话，挑一句值得记的引上去，别整段搬\n"
                 f"- {length_hint}，可以用一两个小标题，别堆列表和表格"
                 f"{continue_hint}"
+                f"{title_hint}"
+                f"{group_hint}"
                 f"{tag_hint}"
             )
         else:
@@ -629,6 +805,7 @@ class LijianPlugin(Star):
                 "- 不要编对方说过的话，也不要编这些天发生了什么——什么消息都没有\n"
                 "- 八十到一百五十字，短一点，别铺陈，别抒情到天上去"
                 f"{continue_hint}"
+                f"{title_hint}"
                 f"{tag_hint}"
             )
 
@@ -654,13 +831,16 @@ class LijianPlugin(Star):
             return {"ok": False, "message": "模型返回了空正文，素材没动，可以再试一次"}
         if not ai_tags:
             ai_tags = ["日记"]
+        title = None if continued else normalize_diary_title(None, body, today)
+        if title:
+            body = strip_repeated_title(body, title)
         try:
             note = await asyncio.to_thread(
                 self._live_db().write_diary_from_ai,
                 {
                     "content_md": body,
-                    "title": None,
-                    "diary_date": None,
+                    "title": title,
+                    "diary_date": today,
                     "tags": ai_tags,
                     "mode": "append_today",
                 },
@@ -678,7 +858,7 @@ class LijianPlugin(Star):
             self._live_db().state_set(
                 "auto_write",
                 {
-                    "date": local_today(),
+                    "date": note["diary_date"],
                     "note_id": note["id"],
                     "chars": len(body),
                     "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -916,7 +1096,8 @@ class LijianPlugin(Star):
             stats = {"notes": 0, "words": 0, "archived": 0}
             logger.warning(f"璃笺统计失败: {exc}")
         try:
-            material_count = self._live_db().material_pending()
+            source, groups = self._material_options()
+            material_count = self._live_db().material_pending(source, groups)
         except Exception:  # noqa: BLE001
             material_count = 0
 
@@ -925,6 +1106,11 @@ class LijianPlugin(Star):
             f"{stats.get('words', 0)} 字，归档 {stats.get('archived', 0)} 篇",
             "",
         ]
+        source, groups = self._material_options()
+        source_name = {"private": "私聊", "group": "群聊", "both": "私聊和群聊"}[source]
+        lines.append(f"日记素材：{source_name}")
+        if source != "private":
+            lines.append(f"采集群聊：{'、'.join(groups) if groups else '所有群聊'}")
         # 自动写日记：说人话，告诉她今晚会不会写、现在还差什么
         if not self._auto_write_enabled():
             lines.append("自己写日记：关了")
@@ -941,6 +1127,8 @@ class LijianPlugin(Star):
                 lines.append(
                     f"自己写日记：定在 {at}，还有 {material_count} 条聊天没写进去"
                 )
+            elif source == "group":
+                lines.append(f"自己写日记：定在 {at}，选定群聊还没新素材，先不写")
             else:
                 gap = self._days_since_last_diary()
                 if gap < 0:
